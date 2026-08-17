@@ -246,22 +246,56 @@ class MainActivity : Activity() {
                     for (i in 0 until foods.length()) {
                         val f = foods.getJSONObject(i)
                         foodCache[f.getInt("id")] = f
-                        val stock = f.optInt("stock", 0)
-                        val desc = f.optString("description")
-                        val label = buildString {
-                            append(f.optString("name")); append("\n")
-                            append(money(f.optInt("price"))); append("  •  Kho: "); append(stock)
-                            if (desc.isNotBlank()) append("\n").append(desc)
-                        }
-                        root.addView(button(label) {
-                            if (stock <= 0) toast("Món này đã hết") else addFood(f)
-                        })
+                        root.addView(foodCard(f))
                     }
                     root.addView(button("🛒  Giỏ hàng (${cart.values.sum()})") { showCart() })
                     root.addView(button("← Trang chủ") { showHome() })
                 }
             } catch (e: Exception) { runOnUiThread { loading.text = "Không tải được thực đơn: ${e.message ?: "Vui lòng thử lại"}" } }
         }
+    }
+
+    /** 1 thẻ món ăn: ảnh bên trái + tên/giá/kho/mô tả bên phải + nút thêm vào giỏ. */
+    private fun foodCard(f: JSONObject): View {
+        val stock = f.optInt("stock", 0)
+        val desc = f.optString("description")
+        val imageUrl = f.optString("image")
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setBackgroundColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 0, 0, dp(10)) }
+        }
+
+        val thumb = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundColor(Color.rgb(238, 238, 238))
+        }
+        card.addView(thumb, LinearLayout.LayoutParams(dp(88), dp(88)))
+        if (imageUrl.isNotBlank()) loadImageInto(imageUrl, thumb)
+
+        val info = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), 0, 0, 0)
+        }
+        info.addView(TextView(this).apply {
+            text = f.optString("name"); textSize = 16f; setTypeface(null, android.graphics.Typeface.BOLD)
+        })
+        info.addView(TextView(this).apply {
+            text = money(f.optInt("price")) + "  •  Kho: $stock"; textSize = 14f
+        })
+        if (desc.isNotBlank()) {
+            info.addView(TextView(this).apply {
+                text = desc; textSize = 13f; setTextColor(Color.DKGRAY); maxLines = 2
+            })
+        }
+        info.addView(button(if (stock <= 0) "Hết hàng" else "+ Thêm") {
+            if (stock <= 0) toast("Món này đã hết") else addFood(f)
+        }.apply { isEnabled = stock > 0 })
+
+        card.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
+        return card
     }
 
     private fun addFood(food: JSONObject) {
@@ -285,7 +319,17 @@ class MainActivity : Activity() {
                 val f = foodCache[id]
                 if (f != null) {
                     val line = f.optInt("price") * qty; total += line
-                    val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                    val row = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                        setPadding(0, dp(6), 0, dp(6))
+                    }
+                    val thumb = ImageView(this).apply {
+                        scaleType = ImageView.ScaleType.CENTER_CROP
+                        setBackgroundColor(Color.rgb(238, 238, 238))
+                    }
+                    row.addView(thumb, LinearLayout.LayoutParams(dp(52), dp(52)).apply { rightMargin = dp(10) })
+                    val imgUrl = f.optString("image")
+                    if (imgUrl.isNotBlank()) loadImageInto(imgUrl, thumb)
                     row.addView(TextView(this).apply { text = "${f.optString("name")} × $qty\n${money(line)}"; textSize = 17f }, LinearLayout.LayoutParams(0, -2, 1f))
                     row.addView(button("−") { if ((cart[id] ?: 0) <= 1) cart.remove(id) else cart[id] = (cart[id] ?: 1) - 1; saveCart(); showCart() })
                     row.addView(button("+") {
@@ -477,14 +521,73 @@ class MainActivity : Activity() {
                     root.removeView(loading)
                     if (a.length() == 0) root.addView(TextView(this).apply { text = "Chưa có đơn hàng."; textSize = 17f })
                     for (i in 0 until a.length()) {
-                        val o = a.getJSONObject(i)
-                        root.addView(button("${o.getString("code")}\n${o.getString("status")} • ${money(o.getInt("total"))}\nThanh toán: ${o.optString("payment_status")}") { showOrder(o.getString("code")) })
+                        root.addView(orderCard(a.getJSONObject(i)))
                     }
                     root.addView(button("🔄 Làm mới") { showOrders() })
                     root.addView(button("← Trang chủ") { showHome() })
                 }
             } catch (_: Exception) { runOnUiThread { loading.text = "Không tải được đơn hàng. Vui lòng thử lại." } }
         }
+    }
+
+    /** 1 thẻ đơn hàng trong danh sách — đủ 6 cột như bảng account.php trên web:
+     *  Mã đơn (+ngày), Tổng tiền, Thanh toán, Trạng thái, Quay thưởng, Nhận hàng. */
+    private fun orderCard(o: JSONObject): View {
+        val code = o.getString("code")
+        val createdAt = o.optString("created_at")
+        val total = o.optInt("total")
+        val paid = o.optString("payment_status") == "paid"
+        val status = o.optString("status")
+        val luckyCode = o.optString("lucky_code")
+        val confirmed = o.optInt("delivery_confirmed") == 1
+        val points = o.optInt("points_earned")
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setBackgroundColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 0, 0, dp(12)) }
+            isClickable = true
+            setOnClickListener { showOrder(code) }
+        }
+
+        card.addView(TextView(this).apply {
+            text = "Mã đơn: $code" + if (createdAt.isNotBlank()) "\n$createdAt" else ""
+            textSize = 16f; setTypeface(null, android.graphics.Typeface.BOLD)
+        })
+        card.addView(row("Tổng tiền", money(total)))
+        card.addView(row("Thanh toán", if (paid) "✅ Đã thanh toán" else "⏳ Chưa thanh toán"))
+        card.addView(row("Trạng thái", status + if (confirmed) "\nKhách đã xác nhận nhận hàng" else ""))
+        card.addView(row("Quay thưởng", if (luckyCode.isNotBlank()) luckyCode else "—"))
+
+        // Cột "Nhận hàng"
+        when {
+            confirmed -> card.addView(row("Nhận hàng", "✅ Đã nhận hàng  •  +$points điểm"))
+            status == "Hoàn thành" -> {
+                lateinit var confirmBtn: Button
+                confirmBtn = button("📦 Tôi đã nhận hàng") {
+                    confirmBtn.isEnabled = false
+                    executor.execute {
+                        try {
+                            val rr = api.request("confirm_delivery", "POST", JSONObject().put("code", code).toString())
+                            runOnUiThread {
+                                if (rr.optBoolean("ok")) { toast(rr.optString("message", "Đã xác nhận nhận hàng")); showOrders() }
+                                else { confirmBtn.isEnabled = true; toast(rr.optString("message", "Chưa thể xác nhận nhận hàng")) }
+                            }
+                        } catch (_: Exception) { runOnUiThread { confirmBtn.isEnabled = true; toast("Không kết nối được máy chủ") } }
+                    }
+                }
+                card.addView(confirmBtn)
+            }
+            status == "Đang giao" -> card.addView(row("Nhận hàng", "🚚 Đang giao. Nút xác nhận sẽ xuất hiện khi đơn Hoàn thành."))
+            else -> card.addView(row("Nhận hàng", "Chưa thể xác nhận nhận hàng."))
+        }
+
+        return card
+    }
+
+    private fun row(label: String, value: String) = TextView(this).apply {
+        text = "$label: $value"; textSize = 15f; setPadding(0, dp(4), 0, dp(4))
     }
 
     private fun showOrder(code: String) {
