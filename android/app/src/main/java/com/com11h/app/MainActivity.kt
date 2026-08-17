@@ -383,7 +383,7 @@ class MainActivity : Activity() {
         val code = order.getString("code")
         val total = order.getInt("total")
         val statusView = TextView(this).apply {
-            text = "⏳ Đang chờ xác nhận thanh toán..."
+            text = "⏳ Đang chờ xác nhận thanh toán...\nMã đơn: $code"
             textSize = 18f
             setTypeface(null, android.graphics.Typeface.BOLD)
             setPadding(0, 0, 0, dp(12))
@@ -394,17 +394,24 @@ class MainActivity : Activity() {
             textSize = 17f
             setPadding(0, 0, 0, dp(14))
         })
+
+        // Wrap the QR in its own container so it can be hidden as one unit
+        // the moment payment is confirmed.
+        val qrContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val qr = ImageView(this).apply { adjustViewBounds = true; minimumHeight = dp(220); scaleType = ImageView.ScaleType.CENTER_INSIDE }
-        root.addView(qr, LinearLayout.LayoutParams(-1, dp(260)))
+        qrContainer.addView(qr, LinearLayout.LayoutParams(-1, dp(260)))
+        root.addView(qrContainer)
         loadImageInto(p.optString("qr_url"), qr)
-        root.addView(button("📱 Mở QR bằng trình duyệt/app ngân hàng") { openUrl(p.optString("qr_url")) })
+
+        val openQrButton = button("📱 Mở QR bằng trình duyệt/app ngân hàng") { openUrl(p.optString("qr_url")) }
+        root.addView(openQrButton)
         root.addView(button("🔄 Kiểm tra ngay") { showOrder(code) })
         root.addView(button("← Trang chủ") { showHome() })
 
-        startPaymentPolling(code, statusView)
+        startPaymentPolling(code, statusView, qrContainer, openQrButton)
     }
 
-    private fun startPaymentPolling(code: String, statusView: TextView) {
+    private fun startPaymentPolling(code: String, statusView: TextView, qrContainer: View, openQrButton: View) {
         paymentPolling = true
         val startedAt = System.currentTimeMillis()
         val maxDurationMs = 10 * 60 * 1000L
@@ -417,26 +424,41 @@ class MainActivity : Activity() {
                 return
             }
             executor.execute {
+                var paid = false
                 try {
                     val r = api.request("order", params = mapOf("code" to code))
                     val d = r.optJSONObject("data")
                     val o = d?.optJSONObject("order")
-                    val paid = o?.optString("payment_status") == "paid"
-                    runOnUiThread {
-                        if (!paymentPolling) return@runOnUiThread
-                        if (paid) {
-                            paymentPolling = false
-                            statusView.text = "✅ Đã nhận tiền"
-                            toast("Thanh toán đơn $code đã được xác nhận")
-                            mainHandler.postDelayed({ showOrder(code) }, 900)
-                        } else {
-                            statusView.text = "⏳ Đang chờ ngân hàng xác nhận...\nTự kiểm tra mỗi 5 giây"
-                        }
-                    }
+                    paid = o?.optString("payment_status") == "paid"
                 } catch (_: Exception) {
                     // Keep polling silently; the user can still use "Kiểm tra ngay".
                 }
-                if (paymentPolling) mainHandler.postDelayed({ poll() }, 5000L)
+
+                if (paid) {
+                    // Stop polling on the background thread first, before touching the UI,
+                    // so a second in-flight poll() can't race and schedule another round.
+                    paymentPolling = false
+
+                    // 1) Reload account info (points/profile) right away so it's fresh
+                    // the next time the user opens "Tài khoản".
+                    try { api.request("profile") } catch (_: Exception) { }
+
+                    runOnUiThread {
+                        // 2) Ẩn QR ngay lập tức.
+                        qrContainer.visibility = View.GONE
+                        openQrButton.visibility = View.GONE
+                        // 3) Hiển thị "Đã thanh toán" kèm mã đơn.
+                        statusView.text = "✅ Đã thanh toán\nMã đơn: $code"
+                        toast("Thanh toán đơn $code đã được xác nhận")
+                        // 4) Tải lại chi tiết đơn hàng từ máy chủ.
+                        mainHandler.postDelayed({ showOrder(code) }, 900)
+                    }
+                } else {
+                    runOnUiThread {
+                        if (paymentPolling) statusView.text = "⏳ Đang chờ ngân hàng xác nhận...\nMã đơn: $code\nTự kiểm tra mỗi 5 giây"
+                    }
+                    if (paymentPolling) mainHandler.postDelayed({ poll() }, 5000L)
+                }
             }
         }
         mainHandler.post { poll() }
