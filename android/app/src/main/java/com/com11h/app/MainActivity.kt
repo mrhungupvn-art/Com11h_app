@@ -1,4 +1,4 @@
-package com.com11h.app
+﻿package com.com11h.app
 
 import android.content.Intent
 import android.graphics.Color
@@ -710,7 +710,7 @@ class MainActivity : SessionActivity() {
     private var pendingReminderTime = 0L
     private var pendingReminderMsg = ""
 
-    /** Thêm nút 🔔 nổi vào GÓC DƯỚI-PHẢI của toàn màn hình (không phải chỉ trong nội dung cuộn), nổi phía trên thanh điều hướng dưới cùng. */
+    /** Thêm nút 🔔 nổi vào GÓC DƯỚI-PHẢI của toàn màn hình (không phải chỉ trong nội dung cuộn), nổi phía trên thanh điều hướng dưới cùng, kèm chú thích "Đặt hẹn lấy hàng" ngay bên dưới để khách biết công dụng của nút. */
     private fun addDeliveryReminderFab(prefillTimeText: () -> String) {
         val root = findViewById<FrameLayout>(android.R.id.content)
         val fab = TextView(this).apply {
@@ -719,7 +719,18 @@ class MainActivity : SessionActivity() {
             elevation = dp(6).toFloat()
             setOnClickListener { showReminderTimePicker(prefillTimeText()) }
         }
-        root.addView(fab, FrameLayout.LayoutParams(dp(52), dp(52), Gravity.BOTTOM or Gravity.END).apply {
+        val caption = TextView(this).apply {
+            text = "Đặt hẹn lấy cơm"; textSize = 11f; gravity = Gravity.CENTER; setTextColor(primary)
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(0, dp(4), 0, 0)
+        }
+        val fabGroup = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            addView(fab, LinearLayout.LayoutParams(dp(52), dp(52)))
+            addView(caption, LinearLayout.LayoutParams(dp(90), -2))
+        }
+        root.addView(fabGroup, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
             rightMargin = dp(16); bottomMargin = dp(16) + dp(58) // dp(58) = chiều cao thanh điều hướng, tránh đè lên
         })
     }
