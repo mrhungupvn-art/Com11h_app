@@ -422,6 +422,7 @@ class MainActivity : SessionActivity() {
             }
         }
         c.addView(previewBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+        addDeliveryReminderFab { time.text.toString() }
     }
 
     // =========================================================================
@@ -697,6 +698,70 @@ class MainActivity : SessionActivity() {
                     }
                 }
             } catch (_: Exception) { runOnUiThread { loadingView.text = "Không thể đồng bộ tài khoản. Kiểm tra mạng rồi thử lại."; c.addView(button("Thử lại") { showProfile() }) } }
+        }
+    }
+
+    // =========================================================================
+    // NHẮC GIỜ NHẬN CƠM — nút 🔔 nổi ở góc dưới-phải màn hình (chỉ ở bước đặt
+    // hàng), không chiếm diện tích nội dung. Khách chọn giờ muốn được nhắc,
+    // app đặt 1 báo thức cục bộ (AlarmManager) — không cần server, không tốn
+    // phí, không thêm thư viện ngoài.
+    // =========================================================================
+    private var pendingReminderTime = 0L
+    private var pendingReminderMsg = ""
+
+    /** Thêm nút 🔔 nổi vào GÓC DƯỚI-PHẢI của toàn màn hình (không phải chỉ trong nội dung cuộn), nổi phía trên thanh điều hướng dưới cùng. */
+    private fun addDeliveryReminderFab(prefillTimeText: () -> String) {
+        val root = findViewById<FrameLayout>(android.R.id.content)
+        val fab = TextView(this).apply {
+            text = "⏰"; textSize = 22f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(primary) }
+            elevation = dp(6).toFloat()
+            setOnClickListener { showReminderTimePicker(prefillTimeText()) }
+        }
+        root.addView(fab, FrameLayout.LayoutParams(dp(52), dp(52), Gravity.BOTTOM or Gravity.END).apply {
+            rightMargin = dp(16); bottomMargin = dp(16) + dp(58) // dp(58) = chiều cao thanh điều hướng, tránh đè lên
+        })
+    }
+
+    /** Dò giờ dạng "18:30" / "18h30" / "6h" trong chuỗi khách đã gõ, dùng làm giờ mặc định mở time picker (không bắt buộc phải đúng, khách vẫn chỉnh lại được). */
+    private fun parseHourMinute(text: String): Pair<Int, Int>? {
+        val m = Regex("""(\d{1,2})\s*[:h]\s*(\d{1,2})?""").find(text) ?: return null
+        val h = m.groupValues[1].toIntOrNull() ?: return null
+        val min = m.groupValues[2].toIntOrNull() ?: 0
+        if (h !in 0..23 || min !in 0..59) return null
+        return h to min
+    }
+
+    private fun showReminderTimePicker(prefillText: String) {
+        val now = java.util.Calendar.getInstance()
+        val (defHour, defMinute) = parseHourMinute(prefillText) ?: (now.get(java.util.Calendar.HOUR_OF_DAY) to now.get(java.util.Calendar.MINUTE))
+        android.app.TimePickerDialog(this, { _, hour, minute ->
+            val cal = java.util.Calendar.getInstance().apply {
+                set(java.util.Calendar.HOUR_OF_DAY, hour); set(java.util.Calendar.MINUTE, minute); set(java.util.Calendar.SECOND, 0)
+            }
+            if (cal.timeInMillis <= System.currentTimeMillis()) cal.add(java.util.Calendar.DAY_OF_YEAR, 1)
+            scheduleReminderWithPermission(cal.timeInMillis, String.format("Đã %02d:%02d — tới giờ nhận cơm bạn đặt rồi, ra nhận nhé!", hour, minute))
+        }, defHour, defMinute, true).show()
+    }
+
+    private fun scheduleReminderWithPermission(triggerAt: Long, message: String) {
+        if (!ReminderHelper.hasNotificationPermission(this)) {
+            pendingReminderTime = triggerAt; pendingReminderMsg = message
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 9001)
+            return
+        }
+        if (ReminderHelper.schedule(this, triggerAt, message)) toast("🔔 Đã đặt nhắc giờ nhận cơm") else toast("Không đặt được nhắc giờ")
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != 9001) return
+        if (grantResults.isNotEmpty() && grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED && pendingReminderTime > 0) {
+            if (ReminderHelper.schedule(this, pendingReminderTime, pendingReminderMsg)) toast("🔔 Đã đặt nhắc giờ nhận cơm")
+            pendingReminderTime = 0L
+        } else {
+            toast("Cần cho phép thông báo để dùng tính năng nhắc giờ")
         }
     }
 

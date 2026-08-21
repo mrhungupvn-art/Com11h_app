@@ -1,5 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Nhắc khách tới giờ nhận cơm (thông báo cục bộ qua AlarmManager, không server) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application android:theme="@style/AppTheme" android:label="Com11h.com" android:allowBackup="true" android:supportsRtl="true" android:usesCleartextTraffic="false" android:icon="@drawable/com11h_logo">
         <activity android:name=".HomeActivity" android:screenOrientation="portrait" android:exported="true">
             <intent-filter>
@@ -13,5 +15,7 @@
         <activity android:name=".LegacyRouterActivity" android:screenOrientation="portrait" android:exported="false" />
         <activity android:name=".MainActivity" android:screenOrientation="portrait" android:exported="false" />
         <activity android:name=".AccountActivity" android:screenOrientation="portrait" android:exported="false" />
+        <!-- Nhận báo thức từ AlarmManager để hiển thị thông báo nhắc giờ nhận cơm -->
+        <receiver android:name=".ReminderReceiver" android:exported="false" />
     </application>
 </manifest>
