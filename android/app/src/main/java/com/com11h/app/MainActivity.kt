@@ -54,13 +54,14 @@ class MainActivity : SessionActivity() {
     private fun ghostButton(v: String, click: () -> Unit) = TextView(this).apply { text = v; textSize = 15f; gravity = Gravity.CENTER; setTextColor(primary); background = outline(primary, 13); setPadding(dp(12), dp(11), dp(12), dp(11)); setOnClickListener { click() } }
 
     /**
-     * Bấm vào ảnh món ăn (ở Thực đơn): xem ảnh PHÓNG TO ngay trong app, dùng
-     * lại đúng màn hình zoom của banner (BannerViewActivity) — khách chụm/mở
-     * 2 ngón tay để phóng to, thu nhỏ, kéo xem chi tiết ảnh.
+     * Bấm vào ảnh 1 món ăn (ở Thực đơn): xem ảnh PHÓNG TO ngay trong app, dùng
+     * lại đúng màn hình zoom của banner (BannerViewActivity), kèm TOÀN BỘ danh
+     * sách món đang hiển thị (đã lọc theo danh mục/từ khoá) để khách vuốt sang
+     * trái/phải xem tiếp ảnh các món khác — khách chụm/mở 2 ngón tay để phóng
+     * to, thu nhỏ, kéo xem chi tiết ảnh như trước.
      */
-    private fun openFoodImage(imageUrl: String, title: String) {
-        if (imageUrl.isBlank()) return
-        startActivity(Intent(this, BannerViewActivity::class.java).putExtra("image", imageUrl).putExtra("title", title))
+    private fun openFoodGallery(items: JSONArray, index: Int) {
+        startActivity(Intent(this, BannerViewActivity::class.java).putExtra("items", items.toString()).putExtra("index", index))
     }
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
@@ -214,7 +215,12 @@ class MainActivity : SessionActivity() {
                             listBox.addView(label(if (keyword.isNotEmpty()) "Không tìm thấy món nào khớp với \"$keyword\"." else "Không có món nào trong danh mục này.", 14f, secondary))
                             return
                         }
-                        filtered.forEach { f -> listBox.addView(foodCard(f)) }
+                        // Danh sách ảnh của đúng các món đang hiển thị ở đây (sau
+                        // khi lọc theo danh mục/từ khoá) — để khách vuốt sang
+                        // trái/phải trong màn xem ảnh phóng to là xem tiếp các
+                        // món khác NGAY TRONG danh sách đang lọc này.
+                        val itemsJson = JSONArray().apply { filtered.forEach { ff -> put(JSONObject().put("image", ff.image).put("title", ff.name)) } }
+                        filtered.forEachIndexed { idx, f -> listBox.addView(foodCard(f, itemsJson, idx)) }
                     }
                     fun renderChips() {
                         chipsRow.removeAllViews()
@@ -240,14 +246,14 @@ class MainActivity : SessionActivity() {
         }
     }
 
-    private fun foodCard(f: Food): LinearLayout {
+    private fun foodCard(f: Food, galleryItems: JSONArray, galleryIndex: Int): LinearLayout {
         val card = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; background = bg(Color.WHITE, 16); setPadding(dp(10), dp(10), dp(10), dp(10)); layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(9) } }
         // Ảnh món ăn to hơn trước và có thể bấm vào để xem phóng to (chụm/mở
         // 2 ngón tay để zoom, kéo xem chi tiết), giống hệt cách xem banner.
         val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; background = bg(Color.rgb(255, 245, 240), 14); clipToOutline = true }
         card.addView(img, LinearLayout.LayoutParams(dp(86), dp(86)))
         ImageLoader.load(img, f.image)
-        img.setOnClickListener { openFoodImage(f.image, f.name) }
+        img.setOnClickListener { openFoodGallery(galleryItems, galleryIndex) }
         val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(11), 0, dp(6), 0) }
         info.addView(label(f.name, 17f, dark, true))
         if (f.description.isNotBlank()) info.addView(label(f.description, 13.5f, secondary))

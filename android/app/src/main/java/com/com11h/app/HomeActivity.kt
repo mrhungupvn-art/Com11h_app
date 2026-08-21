@@ -206,27 +206,30 @@ class HomeActivity : SessionActivity() {
     }
 
     /**
-     * Bấm vào banner: xem ảnh PHÓNG TO ngay trong app (không nhảy sang link
-     * đích/website nữa) — khách chụm/mở 2 ngón tay để phóng to, thu nhỏ, kéo
-     * xem chi tiết nội dung trên ảnh. Vẫn âm thầm gọi banner_click.php ở nền
-     * (không mở màn hình nào) để Admin tiếp tục nhận đúng số lượt click banner
-     * như trước — chỉ khác là app không điều hướng khách ra khỏi màn hình nữa.
+     * Bấm vào 1 banner: xem ảnh PHÓNG TO ngay trong app (không nhảy sang link
+     * đích/website nữa), kèm TOÀN BỘ dải banner để khách vuốt sang trái/phải
+     * xem tiếp các banner khác ngay trong màn xem ảnh — không phải thoát ra
+     * bấm lại từng banner. BannerViewActivity tự âm thầm gọi banner_click.php
+     * cho từng banner đang xem (kể cả khi vuốt sang) nhờ "ping" = true, để
+     * Admin vẫn nhận đúng số lượt click banner như trước.
      */
-    private fun openBanner(id: Int, imageUrl: String, title: String) {
-        if (id > 0) executor.execute {
-            try { (java.net.URL("$SITE_URL/banner_click.php?id=$id").openConnection() as java.net.HttpURLConnection).apply { connectTimeout = 8000; readTimeout = 8000; requestMethod = "GET" }.inputStream.close() } catch (_: Exception) { }
-        }
-        startActivity(Intent(this, BannerViewActivity::class.java).putExtra("image", imageUrl).putExtra("title", title))
+    private fun openBannerGallery(banners: JSONArray, index: Int) {
+        startActivity(Intent(this, BannerViewActivity::class.java)
+            .putExtra("items", banners.toString())
+            .putExtra("index", index)
+            .putExtra("ping", true))
     }
 
     /**
-     * Bấm vào ảnh món ăn (ở "Món ăn phổ biến"): xem ảnh PHÓNG TO ngay trong
-     * app, dùng lại đúng màn hình zoom của banner (BannerViewActivity) —
-     * khách chụm/mở 2 ngón tay để phóng to, thu nhỏ, kéo xem chi tiết ảnh.
+     * Bấm vào ảnh 1 món ăn (ở "Món ăn phổ biến" hoặc "Menu Vip"): xem ảnh
+     * PHÓNG TO ngay trong app, dùng lại đúng màn hình zoom của banner
+     * (BannerViewActivity), kèm TOÀN BỘ danh sách món đang hiển thị để khách
+     * vuốt sang trái/phải xem tiếp ảnh các món khác trong cùng danh sách.
      */
-    private fun openFoodImage(imageUrl: String, title: String) {
-        if (imageUrl.isBlank()) return
-        startActivity(Intent(this, BannerViewActivity::class.java).putExtra("image", imageUrl).putExtra("title", title))
+    private fun openFoodGallery(foods: JSONArray, index: Int) {
+        startActivity(Intent(this, BannerViewActivity::class.java)
+            .putExtra("items", foods.toString())
+            .putExtra("index", index))
     }
 
     /** Tải banner trang chủ từ api?action=banners (đồng bộ Admin > Banner trang chủ) và hiển thị dạng slider tự chạy. */
@@ -247,7 +250,6 @@ class HomeActivity : SessionActivity() {
                 }
                 for (i in 0 until arr.length()) {
                     val b = arr.getJSONObject(i)
-                    val id = b.optInt("id")
                     val title = b.optString("title")
                     val imageUrl = b.optString("image")
                     val slide = FrameLayout(this)
@@ -262,7 +264,7 @@ class HomeActivity : SessionActivity() {
                     }
                     slide.clipToOutline = true
                     slide.background = bg(Color.rgb(255, 245, 240), 20)
-                    slide.setOnClickListener { openBanner(id, imageUrl, title) }
+                    slide.setOnClickListener { openBannerGallery(arr, i) }
                     flipper.addView(slide)
                     ImageLoader.load(img, b.optString("image"))
                 }
@@ -296,6 +298,10 @@ class HomeActivity : SessionActivity() {
                 for (i in 0 until arr.length()) list.add(arr.getJSONObject(i))
                 list.shuffle()
                 val count = minOf(6, list.size)
+                // Danh sách ảnh của đúng các món đang hiển thị ở đây (không phải
+                // toàn bộ thực đơn) — để khách vuốt sang trái/phải trong màn xem
+                // ảnh phóng to là xem tiếp các món khác NGAY TRONG "Món ăn phổ biến".
+                val itemsJson = JSONArray().apply { for (i in 0 until count) put(JSONObject().put("image", list[i].optString("image")).put("title", list[i].optString("name"))) }
                 for (i in 0 until count) {
                     val f = list[i]
                     val name = f.optString("name")
@@ -305,7 +311,7 @@ class HomeActivity : SessionActivity() {
                     // (chụm/mở 2 ngón tay để zoom), giống hệt cách xem banner.
                     val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; background = bg(Color.rgb(255, 245, 240), 14); clipToOutline = true }
                     card.addView(img, LinearLayout.LayoutParams(dp(68), dp(68))); ImageLoader.load(img, imageUrl)
-                    img.setOnClickListener { openFoodImage(imageUrl, name) }
+                    img.setOnClickListener { openFoodGallery(itemsJson, i) }
                     val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(10), 0, 0, 0) }
                     info.addView(label(name, 17f, text, true)); info.addView(label(String.format("%,d", f.optInt("price")).replace(',', '.') + "đ", 16f, primary, true)); info.addView(label("còn ${f.optInt("stock")} phần", 13f, secondary)); card.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
                     info.setOnClickListener { open("menu") }
@@ -338,8 +344,12 @@ class HomeActivity : SessionActivity() {
                     return@runOnUiThread
                 }
                 list.shuffle()
+                // Danh sách ảnh của đúng dải "Menu Vip" này (1 bản, không nhân
+                // đôi) — để khách vuốt sang trái/phải trong màn xem ảnh phóng to
+                // là xem tiếp các món Vip khác, kể cả khi bấm vào bản sao thứ 2.
+                val itemsJson = JSONArray().apply { list.forEach { f -> put(JSONObject().put("image", f.optString("image")).put("title", f.optString("name"))) } }
                 // Thêm đúng 2 lần cùng danh sách để cuộn lặp liền mạch.
-                repeat(2) { list.forEach { f -> row.addView(vipCard(f)) } }
+                repeat(2) { list.forEachIndexed { idx, f -> row.addView(vipCard(f, itemsJson, idx)) } }
                 row.post {
                     vipSingleSetWidth = row.width / 2
                     startVipAutoScroll()
@@ -348,8 +358,8 @@ class HomeActivity : SessionActivity() {
         }
     }
 
-    /** Một thẻ ảnh món trong dải "Menu Vip": ảnh + tên + giá, bấm vào để xem ảnh to và tự thêm vào giỏ. */
-    private fun vipCard(f: JSONObject): View {
+    /** Một thẻ ảnh món trong dải "Menu Vip": ảnh + tên + giá, bấm vào để xem ảnh to (vuốt xem tiếp các món Vip khác) và tự thêm vào giỏ. */
+    private fun vipCard(f: JSONObject, galleryItems: JSONArray, galleryIndex: Int): View {
         val id = f.optInt("id"); val name = f.optString("name"); val imageUrl = f.optString("image")
         val price = f.optInt("price"); val stock = f.optInt("stock")
         val card = LinearLayout(this).apply {
@@ -363,14 +373,14 @@ class HomeActivity : SessionActivity() {
             maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; setPadding(0, dp(5), 0, 0)
         })
         card.addView(label(String.format("%,d", price).replace(',', '.') + "đ", 12.5f, primary, true))
-        card.setOnClickListener { onVipFoodTap(id, name, imageUrl, stock) }
+        card.setOnClickListener { onVipFoodTap(id, name, stock, galleryItems, galleryIndex) }
         return card
     }
 
-    /** Bấm vào 1 món trong "Menu Vip": tự thêm 1 phần vào giỏ hàng, rồi mở ảnh phóng to ngay sau đó. */
-    private fun onVipFoodTap(id: Int, name: String, imageUrl: String, stock: Int) {
+    /** Bấm vào 1 món trong "Menu Vip": tự thêm 1 phần vào giỏ hàng, rồi mở ảnh phóng to (vuốt được) ngay sau đó. */
+    private fun onVipFoodTap(id: Int, name: String, stock: Int, galleryItems: JSONArray, galleryIndex: Int) {
         addVipToCart(id, name, stock)
-        openFoodImage(imageUrl, name)
+        openFoodGallery(galleryItems, galleryIndex)
     }
 
     /** Thêm 1 phần món vào giỏ hàng cục bộ (cùng định dạng/nơi lưu với MainActivity), rồi cập nhật badge 🛒. */
