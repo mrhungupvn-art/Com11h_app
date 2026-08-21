@@ -57,12 +57,24 @@ class HomeActivity : SessionActivity() {
     private var vipUserTouching = false
     private var vipSingleSetWidth = 0
 
-    companion object { private const val SITE_URL = "https://com11h.com" }
+    companion object {
+        private const val SITE_URL = "https://com11h.com"
+        // Chỉ hiện màn chào (logo + "xin chào quý khách") MỘT LẦN cho mỗi lần
+        // mở app. Khách đang ở Thực đơn/Giỏ hàng/Đơn hàng/Tài khoản rồi bấm
+        // "Trang chủ" sẽ tạo lại HomeActivity (xem MainActivity.shell()), khiến
+        // lời chào lặp lại phiền phức dù khách vẫn trong cùng phiên đăng nhập —
+        // biến static này nhớ việc "đã chào rồi" xuyên suốt các lần tạo lại
+        // HomeActivity đó, chỉ reset khi tiến trình app bị hệ thống dọn/tắt hẳn.
+        private var splashShown = false
+    }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun bg(color: Int, radius: Int = 18) = GradientDrawable().apply { setColor(color); cornerRadius = dp(radius).toFloat() }
 
-    override fun onCreate(savedInstanceState: Bundle?) { super.onCreate(savedInstanceState); account = AccountSync(this); showSplash() }
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState); account = AccountSync(this)
+        if (splashShown) showHome() else { splashShown = true; showSplash() }
+    }
     override fun onDestroy() { handler.removeCallbacksAndMessages(null); executor.shutdownNow(); super.onDestroy() }
     // Khách có thể đã thêm/bớt món ở màn Thực đơn hoặc Giỏ hàng, hoặc vừa đăng
     // nhập/đăng xuất, rồi bấm Back quay lại đây (không tạo lại Activity) — cập
