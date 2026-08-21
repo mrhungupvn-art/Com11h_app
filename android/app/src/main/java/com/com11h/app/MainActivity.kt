@@ -1,719 +1,708 @@
 package com.com11h.app
 
-import android.app.Activity
-import android.app.AlertDialog
-import android.content.Context
 import android.content.Intent
-import android.graphics.BitmapFactory
 import android.graphics.Color
-import android.net.Uri
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
-import android.text.InputType
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.widget.*
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
-import java.security.MessageDigest
 import java.util.UUID
-import android.os.Handler
-import android.os.Looper
 import java.util.concurrent.Executors
 
-private class Api(private val context: Context) {
-    private val baseUrl = "https://com11h.com/api/index.php"
-    private val prefs = context.getSharedPreferences("com11h_secure", Context.MODE_PRIVATE)
+/**
+ * COM11H app — toàn bộ dữ liệu thực đơn, đơn hàng, thanh toán, quay số may
+ * mắn và tài khoản được đồng bộ TRỰC TIẾP với com11h.com qua api/index.php
+ * (dùng chung logic nghiệp vụ với web qua core.php, xem AccountSync.kt).
+ * Chỉ có giỏ hàng (trước khi đặt) là lưu tạm trên máy.
+ */
+class MainActivity : SessionActivity() {
+    private lateinit var account: AccountSync
+    private val executor = Executors.newSingleThreadExecutor()
+    private val handler = Handler(Looper.getMainLooper())
+    private val primary = Color.rgb(245, 81, 30)
+    private val dark = Color.rgb(38, 38, 38)
+    private val secondary = Color.rgb(107, 107, 107)
+    private val bgColor = Color.rgb(255, 248, 245)
+    private val danger = Color.rgb(198, 40, 40)
+    private val ok = Color.rgb(46, 125, 50)
 
-    fun token(): String? = prefs.getString("token", null)
-    fun saveToken(token: String) = prefs.edit().putString("token", token).apply()
-    fun clearToken() = prefs.edit().remove("token").apply()
-
-    fun request(
-        action: String,
-        method: String = "GET",
-        body: String? = null,
-        params: Map<String, String> = emptyMap(),
-        idempotencyKey: String? = null
-    ): JSONObject {
-        val query = mutableListOf("action=${URLEncoder.encode(action, "UTF-8")}")
-        params.forEach { (k, v) ->
-            query += "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
-        }
-
-        val conn = (URL("$baseUrl?${query.joinToString("&")}").openConnection() as HttpURLConnection).apply {
-            requestMethod = method
-            connectTimeout = 12000
-            readTimeout = 15000
-            useCaches = false
-            setRequestProperty("Accept", "application/json")
-            token()?.let { setRequestProperty("Authorization", "Bearer $it") }
-            idempotencyKey?.let { setRequestProperty("X-Idempotency-Key", it) }
-        }
-
-        return try {
-            if (body != null) {
-                conn.doOutput = true
-                conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-            }
-            val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
-            val text = stream?.bufferedReader()?.use { it.readText() } ?: "{}"
-            JSONObject(text)
-        } finally {
-            conn.disconnect()
-        }
-    }
-}
-
-class MainActivity : Activity() {
-    private lateinit var api: Api
-    private lateinit var root: LinearLayout
-    private val executor = Executors.newFixedThreadPool(4)
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var paymentPolling = false
+    // Giỏ hàng: food_id -> số lượng. Lưu tạm cục bộ cho tới khi đặt hàng thật qua API.
     private val cart = linkedMapOf<Int, Int>()
-    private val foodCache = hashMapOf<Int, JSONObject>()
+    // Cache thực đơn tải gần nhất từ server, dùng để hiển thị tên/giá/ảnh trong giỏ hàng.
+    private var foodsCache: List<Food> = emptyList()
+    private var pollRunnable: Runnable? = null
+    // Badge số lượng trên icon 🛒 Giỏ hàng ở thanh điều hướng của màn hình đang mở.
+    private var cartBadge: TextView? = null
+
+    data class Food(
+        val id: Int, val name: String, val price: Int, val stock: Int,
+        val category: String, val description: String, val image: String
+    )
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun money(v: Int) = String.format("%,d", v).replace(',', '.') + "đ"
+    private fun bg(color: Int, radius: Int = 16) = GradientDrawable().apply { setColor(color); cornerRadius = dp(radius).toFloat() }
+    private fun outline(color: Int, radius: Int = 16) = GradientDrawable().apply { setColor(Color.WHITE); setStroke(dp(1), color); cornerRadius = dp(radius).toFloat() }
+    private fun label(v: String, size: Float = 17f, color: Int = dark, bold: Boolean = false) = TextView(this).apply { text = v; textSize = size; setTextColor(color); if (bold) setTypeface(null, Typeface.BOLD); setPadding(0, dp(4), 0, dp(4)) }
+    private fun button(v: String, click: () -> Unit) = TextView(this).apply { text = v; textSize = 16f; gravity = Gravity.CENTER; setTextColor(Color.WHITE); setTypeface(null, Typeface.BOLD); background = bg(primary, 13); setPadding(dp(12), dp(13), dp(12), dp(13)); setOnClickListener { click() } }
+    private fun ghostButton(v: String, click: () -> Unit) = TextView(this).apply { text = v; textSize = 15f; gravity = Gravity.CENTER; setTextColor(primary); background = outline(primary, 13); setPadding(dp(12), dp(11), dp(12), dp(11)); setOnClickListener { click() } }
+
+    /**
+     * Bấm vào ảnh món ăn (ở Thực đơn): xem ảnh PHÓNG TO ngay trong app, dùng
+     * lại đúng màn hình zoom của banner (BannerViewActivity) — khách chụm/mở
+     * 2 ngón tay để phóng to, thu nhỏ, kéo xem chi tiết ảnh.
+     */
+    private fun openFoodImage(imageUrl: String, title: String) {
+        if (imageUrl.isBlank()) return
+        startActivity(Intent(this, BannerViewActivity::class.java).putExtra("image", imageUrl).putExtra("title", title))
+    }
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+    /** Icon 👤 Tài khoản ở header — đổi màu nền + có chấm xanh khi khách đã đăng nhập. */
+    private fun profileIconCell(): View {
+        val loggedIn = account.isLoggedIn()
+        val cell = FrameLayout(this)
+        cell.addView(TextView(this).apply {
+            text = "👤"; textSize = 19f; gravity = Gravity.CENTER
+            background = bg(if (loggedIn) Color.rgb(224, 247, 233) else Color.rgb(255, 240, 234), 22)
+            setOnClickListener { showProfile() }
+        }, FrameLayout.LayoutParams(dp(44), dp(44)))
+        if (loggedIn) {
+            cell.addView(View(this).apply {
+                background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(ok); setStroke(dp(2), Color.WHITE) }
+            }, FrameLayout.LayoutParams(dp(13), dp(13), Gravity.BOTTOM or Gravity.END).apply { bottomMargin = dp(3); rightMargin = dp(3) })
+        }
+        return cell
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        api = Api(this)
-        loadCart()
-        showHome()
+        super.onCreate(savedInstanceState); account = AccountSync(this); loadLocalCart()
+        val code = intent.getStringExtra("code")
+        when (intent.getStringExtra("screen")) {
+            "menu" -> showMenu()
+            "cart" -> showCart()
+            "checkout" -> showCheckout()
+            "orders" -> showOrders()
+            "order_detail" -> if (code != null) showOrderDetail(code) else showOrders()
+            "lucky" -> showLucky(code)
+            "daily" -> showDaily()
+            "loyalty" -> showLoyalty()
+            "profile" -> showProfile()
+            else -> { startActivity(Intent(this, HomeActivity::class.java)); finish() }
+        }
     }
+    override fun onDestroy() { stopPolling(); saveLocalCart(); executor.shutdownNow(); super.onDestroy() }
 
-    override fun onDestroy() {
-        saveCart()
-        paymentPolling = false
-        mainHandler.removeCallbacksAndMessages(null)
-        executor.shutdownNow()
-        super.onDestroy()
-    }
+    private fun stopPolling() { pollRunnable?.let { handler.removeCallbacks(it) }; pollRunnable = null }
 
-    private fun saveCart() {
-        val arr = JSONArray()
-        cart.forEach { (id, qty) -> arr.put(JSONObject().put("id", id).put("qty", qty)) }
-        getSharedPreferences("com11h_secure", MODE_PRIVATE).edit().putString("cart", arr.toString()).apply()
-    }
-
-    private fun loadCart() {
-        cart.clear()
-        val raw = getSharedPreferences("com11h_secure", MODE_PRIVATE).getString("cart", null) ?: return
+    private fun loadLocalCart() {
+        val p = getSharedPreferences("com11h_local", MODE_PRIVATE); cart.clear()
         try {
-            val arr = JSONArray(raw)
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                val id = o.optInt("id")
-                val qty = o.optInt("qty")
-                if (id > 0 && qty > 0) cart[id] = qty
-            }
+            val a = JSONArray(p.getString("cart", "[]"))
+            for (i in 0 until a.length()) { val o = a.getJSONObject(i); cart[o.optInt("id")] = o.optInt("qty") }
         } catch (_: Exception) { }
     }
-
-    private fun setup(title: String) {
-        val page = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(16))
-            setBackgroundColor(Color.rgb(248, 250, 248))
-        }
-        setContentView(page)
-        val scroll = ScrollView(this)
-        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val bar = TextView(this).apply {
-            text = title
-            textSize = 24f
-            setTextColor(Color.rgb(22, 128, 60))
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setPadding(0, 0, 0, dp(14))
-        }
-        content.addView(bar)
-        scroll.addView(content)
-        page.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        root = content
+    private fun saveLocalCart() {
+        val p = getSharedPreferences("com11h_local", MODE_PRIVATE)
+        val a = JSONArray(); cart.forEach { (id, q) -> a.put(JSONObject().put("id", id).put("qty", q)) }
+        p.edit().putString("cart", a.toString()).apply()
     }
+    private fun lastAddress(): String = getSharedPreferences("com11h_local", MODE_PRIVATE).getString("last_address", "") ?: ""
+    private fun saveLastAddress(v: String) = getSharedPreferences("com11h_local", MODE_PRIVATE).edit().putString("last_address", v).apply()
 
-    private fun button(text: String, action: () -> Unit) = Button(this).apply {
-        this.text = text
-        textSize = 16f
-        minimumHeight = dp(48)
-        setOnClickListener { action() }
-    }
-
-    private fun input(hint: String, password: Boolean = false) = EditText(this).apply {
-        this.hint = hint
-        textSize = 16f
-        setPadding(dp(12), dp(10), dp(12), dp(10))
-        if (password) inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-    }
-
-    private fun showHome() {
-        setup("COM11H 🍚")
-        root.addView(TextView(this).apply {
-            text = "Cơm trưa ngon – đặt nhanh – giao tận nơi"
-            textSize = 18f
-            gravity = Gravity.CENTER
-            setPadding(0, dp(12), 0, dp(22))
-        })
-        root.addView(button("🍱  Xem thực đơn") { showMenu() })
-        root.addView(button("🛒  Giỏ hàng (${cart.values.sum()})") { showCart() })
-        root.addView(button("📦  Đơn hàng của tôi") { showOrders() })
-        root.addView(button("👤  Tài khoản") { showProfile() })
-        if (api.token() == null) root.addView(button("🔐  Đăng nhập / Đăng ký") { showLogin() })
-        else root.addView(button("🚪  Đăng xuất") { api.clearToken(); showHome() })
-    }
-
-    private fun showLogin() {
-        setup("Đăng nhập")
-        val phone = input("Số điện thoại").apply { inputType = InputType.TYPE_CLASS_PHONE }
-        val pass = input("Mật khẩu", true)
-        root.addView(phone); root.addView(pass)
-        lateinit var login: Button
-        login = button("Đăng nhập") {
-            val p = phone.text.toString().trim()
-            val pw = pass.text.toString()
-            if (p.isEmpty() || pw.isEmpty()) { toast("Vui lòng nhập số điện thoại và mật khẩu"); return@button }
-            login.isEnabled = false
-            executor.execute {
-                try {
-                    val r = api.request("login", "POST", JSONObject(mapOf("phone" to p, "password" to pw, "device" to "COM11H Android")).toString())
-                    runOnUiThread {
-                        login.isEnabled = true
-                        if (r.optBoolean("ok")) {
-                            api.saveToken(r.getJSONObject("data").getString("token"))
-                            toast("Đăng nhập thành công")
-                            showHome()
-                        } else toast(r.optString("message", "Đăng nhập thất bại"))
-                    }
-                } catch (_: Exception) { runOnUiThread { login.isEnabled = true; toast("Không kết nối được máy chủ") } }
+    private fun shell(title: String, selected: Int): LinearLayout {
+        val outer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(bgColor) }
+        val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(12), dp(8), dp(12), dp(8)); setBackgroundColor(Color.WHITE) }
+        header.addView(TextView(this).apply { text = "‹"; textSize = 34f; setTextColor(primary); gravity = Gravity.CENTER; setOnClickListener { startActivity(Intent(this@MainActivity, HomeActivity::class.java)); finish() } }, LinearLayout.LayoutParams(dp(42), dp(48)))
+        header.addView(label(title, 20f, primary, true), LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(4) })
+        header.addView(profileIconCell(), LinearLayout.LayoutParams(dp(44), dp(44))); outer.addView(header)
+        val scroll = ScrollView(this); val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(12), dp(14), dp(18)) }; scroll.addView(content); outer.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        val nav = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Color.WHITE); elevation = dp(8).toFloat() }
+        listOf("⌂\nTrang chủ", "▦\nThực đơn", "🛒\nGiỏ hàng", "▤\nĐơn hàng", "♙\nTài khoản").forEachIndexed { i, name ->
+            val cell = FrameLayout(this)
+            cell.addView(TextView(this).apply { text = name; textSize = 10f; gravity = Gravity.CENTER; setTextColor(if (i == selected) primary else secondary); setTypeface(null, if (i == selected) Typeface.BOLD else Typeface.NORMAL); setOnClickListener { when (i) { 0 -> { startActivity(Intent(this@MainActivity, HomeActivity::class.java)); finish() }; 1 -> showMenu(); 2 -> showCart(); 3 -> showOrders(); 4 -> showProfile() } } }, FrameLayout.LayoutParams(-1, -1))
+            if (i == 2) {
+                cartBadge = TextView(this).apply {
+                    textSize = 9.5f; setTextColor(Color.WHITE); gravity = Gravity.CENTER; setTypeface(null, Typeface.BOLD)
+                    background = bg(Color.rgb(220, 38, 38), 20)
+                    visibility = android.view.View.GONE
+                }
+                cell.addView(cartBadge, FrameLayout.LayoutParams(dp(18), dp(18), Gravity.TOP or Gravity.END).apply { topMargin = dp(2); marginEnd = dp(14) })
             }
+            nav.addView(cell, LinearLayout.LayoutParams(0, dp(58), 1f))
         }
-        root.addView(login)
-        root.addView(button("Đăng ký tài khoản") { showRegister() })
-        root.addView(button("← Quay lại") { showHome() })
+        outer.addView(nav); refreshCartBadge(); return outer
     }
 
-    private fun showRegister() {
-        setup("Đăng ký tài khoản")
-        val name = input("Họ tên")
-        val phone = input("Số điện thoại").apply { inputType = InputType.TYPE_CLASS_PHONE }
-        val pass = input("Mật khẩu – tối thiểu 6 ký tự", true)
-        val pass2 = input("Nhập lại mật khẩu", true)
-        root.addView(name); root.addView(phone); root.addView(pass); root.addView(pass2)
-        lateinit var register: Button
-        register = button("Tạo tài khoản") {
-            val n = name.text.toString().trim(); val p = phone.text.toString().trim(); val pw = pass.text.toString(); val pw2 = pass2.text.toString()
-            if (n.isEmpty() || p.isEmpty() || pw.isEmpty()) { toast("Vui lòng nhập đầy đủ thông tin"); return@button }
-            if (pw.length < 6) { toast("Mật khẩu tối thiểu 6 ký tự"); return@button }
-            if (pw != pw2) { toast("Mật khẩu nhập lại không khớp"); return@button }
-            register.isEnabled = false
-            executor.execute {
-                try {
-                    val body = JSONObject(mapOf("name" to n, "phone" to p, "password" to pw, "password2" to pw2, "device" to "COM11H Android")).toString()
-                    val r = api.request("register", "POST", body)
-                    runOnUiThread {
-                        register.isEnabled = true
-                        if (r.optBoolean("ok")) {
-                            api.saveToken(r.getJSONObject("data").getString("token"))
-                            toast("Đăng ký thành công")
-                            showHome()
-                        } else toast(r.optString("message", "Đăng ký thất bại"))
-                    }
-                } catch (_: Exception) { runOnUiThread { register.isEnabled = true; toast("Không kết nối được máy chủ") } }
-            }
+    /** Cập nhật số lượng (badge đỏ) trên icon 🛒 Giỏ hàng ở thanh điều hướng theo giỏ hàng hiện tại. */
+    private fun refreshCartBadge() {
+        val n = cart.values.sum()
+        cartBadge?.apply {
+            text = if (n > 99) "99+" else n.toString()
+            visibility = if (n > 0) android.view.View.VISIBLE else android.view.View.GONE
         }
-        root.addView(register)
-        root.addView(button("← Quay lại") { showLogin() })
+    }
+    private fun contentOf(s: LinearLayout) = (s.getChildAt(1) as ScrollView).getChildAt(0) as LinearLayout
+
+    private fun loading(c: LinearLayout, msg: String = "Đang tải dữ liệu..."): TextView {
+        val t = label("⏳ $msg", 15f, secondary); c.addView(t); return t
     }
 
+    // =========================================================================
+    // THỰC ĐƠN — lấy TOÀN BỘ dữ liệu món ăn từ server (api?action=menu), không
+    // còn danh sách cứng trong app. Ảnh, giá, tồn kho luôn khớp với web.
+    // =========================================================================
     private fun showMenu() {
-        setup("Thực đơn")
-        val loading = TextView(this).apply { text = "Đang tải thực đơn..."; textSize = 17f }
-        root.addView(loading)
+        val s = shell("Thực đơn", 1); setContentView(s); val c = contentOf(s)
+        val head = label("Món ăn ngon mỗi ngày", 22f, dark, true); c.addView(head)
+        c.addView(label("Đồng bộ trực tiếp từ com11h.com", 14f, secondary))
+
+        // Ô tìm kiếm ngay trong màn Thực đơn — nhận sẵn từ khoá được truyền từ
+        // trang chủ (extra "query") khi khách bấm nút 🔍 hoặc "Tìm kiếm" trên
+        // bàn phím ở ô tìm kiếm trang chủ, đồng thời cho phép gõ lại tại đây.
+        val initialQuery = intent.getStringExtra("query") ?: ""
+        val searchRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val searchInput = EditText(this).apply {
+            hint = "Tìm món ăn..."; textSize = 15f; isSingleLine = true
+            setText(initialQuery)
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+            setPadding(dp(14), 0, dp(14), 0); background = outline(primary, 14)
+        }
+        searchRow.addView(searchInput, LinearLayout.LayoutParams(0, dp(44), 1f))
+        val searchBtn = TextView(this).apply { text = "🔍"; textSize = 17f; gravity = Gravity.CENTER; setTextColor(Color.WHITE); background = bg(primary, 14) }
+        searchRow.addView(searchBtn, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginStart = dp(8) })
+        c.addView(searchRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+
+        val chipsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val chipsScroll = HorizontalScrollView(this).apply { addView(chipsRow) }
+        c.addView(chipsScroll, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10); bottomMargin = dp(4) })
+        val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        c.addView(listBox, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        val loadingView = loading(listBox)
+
         executor.execute {
             try {
-                val r = api.request("menu")
-                if (!r.optBoolean("ok")) throw IllegalStateException(r.optString("message"))
-                val data = r.getJSONObject("data")
-                val foods = data.getJSONArray("foods")
+                val r = account.request("menu")
                 runOnUiThread {
-                    root.removeView(loading)
-                    if (foods.length() == 0) root.addView(TextView(this).apply { text = "Hiện chưa có món."; textSize = 17f })
-                    for (i in 0 until foods.length()) {
-                        val f = foods.getJSONObject(i)
-                        foodCache[f.getInt("id")] = f
-                        root.addView(foodCard(f))
+                    listBox.removeView(loadingView)
+                    if (!r.optBoolean("ok")) { listBox.addView(label("Không tải được thực đơn. ${r.optString("message")}", 14f, danger)); return@runOnUiThread }
+                    val arr = r.optJSONObject("data")?.optJSONArray("foods") ?: JSONArray()
+                    val foods = mutableListOf<Food>()
+                    for (i in 0 until arr.length()) {
+                        val f = arr.getJSONObject(i)
+                        foods.add(Food(f.optInt("id"), f.optString("name"), f.optInt("price"), f.optInt("stock"), f.optString("category"), f.optString("description"), f.optString("image")))
                     }
-                    root.addView(button("🛒  Giỏ hàng (${cart.values.sum()})") { showCart() })
-                    root.addView(button("← Trang chủ") { showHome() })
+                    foodsCache = foods
+                    if (foods.isEmpty()) { listBox.addView(label("Hiện chưa có món nào đang bán.", 14f, secondary)); return@runOnUiThread }
+
+                    val categories = listOf("Tất cả") + foods.map { it.category }.filter { it.isNotBlank() }.distinct()
+                    var selectedCategory = "Tất cả"
+                    fun renderList(cat: String) {
+                        listBox.removeAllViews()
+                        val keyword = searchInput.text.toString().trim()
+                        var filtered = if (cat == "Tất cả") foods else foods.filter { it.category == cat }
+                        if (keyword.isNotEmpty()) {
+                            filtered = filtered.filter { it.name.contains(keyword, ignoreCase = true) || it.description.contains(keyword, ignoreCase = true) }
+                        }
+                        if (filtered.isEmpty()) {
+                            listBox.addView(label(if (keyword.isNotEmpty()) "Không tìm thấy món nào khớp với \"$keyword\"." else "Không có món nào trong danh mục này.", 14f, secondary))
+                            return
+                        }
+                        filtered.forEach { f -> listBox.addView(foodCard(f)) }
+                    }
+                    fun renderChips() {
+                        chipsRow.removeAllViews()
+                        categories.forEach { cat ->
+                            chipsRow.addView(TextView(this@MainActivity).apply {
+                                text = cat; textSize = 14f; gravity = Gravity.CENTER
+                                setPadding(dp(14), dp(8), dp(14), dp(8))
+                                setTextColor(if (cat == selectedCategory) Color.WHITE else primary)
+                                background = if (cat == selectedCategory) bg(primary, 16) else outline(primary, 16)
+                                setOnClickListener { selectedCategory = cat; renderChips(); renderList(cat) }
+                            }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(8) })
+                        }
+                    }
+                    searchBtn.setOnClickListener { renderList(selectedCategory) }
+                    searchInput.setOnEditorActionListener { _, actionId, _ ->
+                        if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH) { renderList(selectedCategory); true } else false
+                    }
+                    renderChips(); renderList(selectedCategory)
                 }
-            } catch (e: Exception) { runOnUiThread { loading.text = "Không tải được thực đơn: ${e.message ?: "Vui lòng thử lại"}" } }
+            } catch (e: Exception) {
+                runOnUiThread { listBox.removeView(loadingView); listBox.addView(label("Lỗi kết nối máy chủ. Kiểm tra mạng rồi thử lại.", 14f, danger)) }
+            }
         }
     }
 
-    /** 1 thẻ món ăn: ảnh bên trái + tên/giá/kho/mô tả bên phải + nút thêm vào giỏ. */
-    private fun foodCard(f: JSONObject): View {
-        val stock = f.optInt("stock", 0)
-        val desc = f.optString("description")
-        val imageUrl = f.optString("image")
-
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            setBackgroundColor(Color.WHITE)
-            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 0, 0, dp(10)) }
-        }
-
-        val thumb = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(Color.rgb(238, 238, 238))
-        }
-        card.addView(thumb, LinearLayout.LayoutParams(dp(88), dp(88)))
-        if (imageUrl.isNotBlank()) loadImageInto(imageUrl, thumb)
-
-        val info = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), 0, 0, 0)
-        }
-        info.addView(TextView(this).apply {
-            text = f.optString("name"); textSize = 16f; setTypeface(null, android.graphics.Typeface.BOLD)
-        })
-        info.addView(TextView(this).apply {
-            text = money(f.optInt("price")) + "  •  Kho: $stock"; textSize = 14f
-        })
-        if (desc.isNotBlank()) {
-            info.addView(TextView(this).apply {
-                text = desc; textSize = 13f; setTextColor(Color.DKGRAY); maxLines = 2
-            })
-        }
-        info.addView(button(if (stock <= 0) "Hết hàng" else "+ Thêm") {
-            if (stock <= 0) toast("Món này đã hết") else addFood(f)
-        }.apply { isEnabled = stock > 0 })
-
+    private fun foodCard(f: Food): LinearLayout {
+        val card = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; background = bg(Color.WHITE, 16); setPadding(dp(10), dp(10), dp(10), dp(10)); layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(9) } }
+        // Ảnh món ăn to hơn trước và có thể bấm vào để xem phóng to (chụm/mở
+        // 2 ngón tay để zoom, kéo xem chi tiết), giống hệt cách xem banner.
+        val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; background = bg(Color.rgb(255, 245, 240), 14); clipToOutline = true }
+        card.addView(img, LinearLayout.LayoutParams(dp(86), dp(86)))
+        ImageLoader.load(img, f.image)
+        img.setOnClickListener { openFoodImage(f.image, f.name) }
+        val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(11), 0, dp(6), 0) }
+        info.addView(label(f.name, 17f, dark, true))
+        if (f.description.isNotBlank()) info.addView(label(f.description, 13.5f, secondary))
+        info.addView(label("${money(f.price)}   •   còn ${f.stock} phần", 15f, primary, true))
         card.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
+        val addBtn = TextView(this).apply {
+            text = if (f.stock <= 0) "Hết" else "+"; textSize = 22f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
+            background = bg(if (f.stock <= 0) secondary else primary, 22)
+            setOnClickListener {
+                if (f.stock <= 0) { toast("Món này đã hết hàng"); return@setOnClickListener }
+                val current = cart[f.id] ?: 0
+                if (current + 1 > f.stock) { toast("Chỉ còn ${f.stock} phần \"${f.name}\""); return@setOnClickListener }
+                cart[f.id] = current + 1; saveLocalCart(); refreshCartBadge(); toast("Đã thêm \"${f.name}\" vào giỏ hàng")
+            }
+        }
+        card.addView(addBtn, LinearLayout.LayoutParams(dp(42), dp(42)))
         return card
     }
 
-    private fun addFood(food: JSONObject) {
-        val id = food.getInt("id")
-        val stock = food.optInt("stock", 0)
-        val current = cart[id] ?: 0
-        if (current >= stock) { toast("Số lượng đã đạt tồn kho hiện tại"); return }
-        cart[id] = current + 1
-        foodCache[id] = food
-        saveCart()
-        toast("Đã thêm ${food.optString("name")}")
-    }
-
+    // =========================================================================
+    // GIỎ HÀNG (cục bộ) -> ĐẶT HÀNG THẬT qua API (order_preview + create_order)
+    // =========================================================================
     private fun showCart() {
-        setup("Giỏ hàng")
-        if (cart.isEmpty()) {
-            root.addView(TextView(this).apply { text = "Giỏ hàng đang trống."; textSize = 18f })
-        } else {
+        val s = shell("Giỏ hàng", 2); setContentView(s); val c = contentOf(s)
+        if (cart.isEmpty()) { c.addView(label("🛒 Giỏ hàng đang trống", 20f, dark, true)); c.addView(button("Xem thực đơn") { showMenu() }); return }
+
+        val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }; c.addView(listBox)
+        val loadingView = loading(listBox, "Đang cập nhật giỏ hàng...")
+
+        fun renderCart(foods: List<Food>) {
+            listBox.removeAllViews()
+            val map = foods.associateBy { it.id }
             var total = 0
             cart.toMap().forEach { (id, qty) ->
-                val f = foodCache[id]
-                if (f != null) {
-                    val line = f.optInt("price") * qty; total += line
-                    val row = LinearLayout(this).apply {
-                        orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-                        setPadding(0, dp(6), 0, dp(6))
-                    }
-                    val thumb = ImageView(this).apply {
-                        scaleType = ImageView.ScaleType.CENTER_CROP
-                        setBackgroundColor(Color.rgb(238, 238, 238))
-                    }
-                    row.addView(thumb, LinearLayout.LayoutParams(dp(52), dp(52)).apply { rightMargin = dp(10) })
-                    val imgUrl = f.optString("image")
-                    if (imgUrl.isNotBlank()) loadImageInto(imgUrl, thumb)
-                    row.addView(TextView(this).apply { text = "${f.optString("name")} × $qty\n${money(line)}"; textSize = 17f }, LinearLayout.LayoutParams(0, -2, 1f))
-                    row.addView(button("−") { if ((cart[id] ?: 0) <= 1) cart.remove(id) else cart[id] = (cart[id] ?: 1) - 1; saveCart(); showCart() })
-                    row.addView(button("+") {
-                        val stock = f.optInt("stock", 0)
-                        val current = cart[id] ?: 0
-                        if (current >= stock) toast("Đã đạt tồn kho hiện tại") else { cart[id] = current + 1; saveCart(); showCart() }
-                    })
-                    root.addView(row)
-                }
+                val f = map[id] ?: run { cart.remove(id); return@forEach }
+                total += f.price * qty
+                val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; background = bg(Color.WHITE, 14); setPadding(dp(10), dp(9), dp(10), dp(9)); layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) } }
+                val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; background = bg(Color.rgb(255, 245, 240), 12) }
+                row.addView(img, LinearLayout.LayoutParams(dp(52), dp(52))); ImageLoader.load(img, f.image)
+                row.addView(label("${f.name}\n${money(f.price)}", 15f, dark, true), LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(8) })
+                val stepper = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                stepper.addView(TextView(this).apply { text = "−"; textSize = 18f; setTextColor(primary); setTypeface(null, Typeface.BOLD); setPadding(dp(10), dp(4), dp(10), dp(4)); setOnClickListener { if (qty <= 1) cart.remove(id) else cart[id] = qty - 1; saveLocalCart(); refreshCartBadge(); renderCart(foods) } })
+                stepper.addView(label("$qty", 15f, dark, true))
+                stepper.addView(TextView(this).apply { text = "+"; textSize = 18f; setTextColor(primary); setTypeface(null, Typeface.BOLD); setPadding(dp(10), dp(4), dp(10), dp(4)); setOnClickListener { if (qty + 1 > f.stock) { toast("Chỉ còn ${f.stock} phần"); return@setOnClickListener }; cart[id] = qty + 1; saveLocalCart(); refreshCartBadge(); renderCart(foods) } })
+                row.addView(stepper); listBox.addView(row)
             }
-            root.addView(TextView(this).apply { text = "Tạm tính: ${money(total)}\nGiá cuối cùng sẽ được máy chủ kiểm tra lại trước khi đặt."; textSize = 18f; setPadding(0, dp(16), 0, dp(16)) })
-            if (api.token() == null) root.addView(button("🔐 Đăng nhập để đặt hàng") { showLogin() })
-            else root.addView(button("📦 Tiến hành đặt hàng") { showCheckout() })
+            if (cart.isEmpty()) { listBox.addView(label("🛒 Giỏ hàng đang trống", 18f, dark, true)); listBox.addView(button("Xem thực đơn") { showMenu() }); return }
+            listBox.addView(label("Tổng cộng: ${money(total)}", 20f, primary, true).apply { gravity = Gravity.END; setPadding(0, dp(12), 0, dp(12)) })
+            listBox.addView(button("Đặt hàng — ${money(total)}") { showCheckout() })
         }
-        root.addView(button("← Thực đơn") { showMenu() })
+
+        executor.execute {
+            val r = if (foodsCache.isNotEmpty()) null else account.request("menu")
+            runOnUiThread {
+                listBox.removeView(loadingView)
+                val foods = if (foodsCache.isNotEmpty()) foodsCache else {
+                    val arr = r?.optJSONObject("data")?.optJSONArray("foods") ?: JSONArray()
+                    val list = mutableListOf<Food>()
+                    for (i in 0 until arr.length()) { val f = arr.getJSONObject(i); list.add(Food(f.optInt("id"), f.optString("name"), f.optInt("price"), f.optInt("stock"), f.optString("category"), f.optString("description"), f.optString("image"))) }
+                    foodsCache = list; list
+                }
+                renderCart(foods)
+            }
+        }
     }
 
+    // Đặt hàng: nhập địa chỉ -> order_preview (server tính lại giá/tồn kho, kiểm
+    // tra khoảng cách giao hàng nếu có) -> create_order (kèm Idempotency-Key).
     private fun showCheckout() {
-        if (api.token() == null) { showLogin(); return }
-        if (cart.isEmpty()) { toast("Giỏ hàng đang trống"); showCart(); return }
-        setup("Xác nhận đặt hàng")
-        val address = input("Địa chỉ giao hàng *")
-        val delivery = input("Thời gian giao (tuỳ chọn)")
-        val note = input("Ghi chú")
-        root.addView(address); root.addView(delivery); root.addView(note)
+        if (!account.isLoggedIn()) { toast("Vui lòng đăng nhập để đặt hàng"); showLogin(); return }
+        val s = shell("Xác nhận đặt hàng", 2); setContentView(s); val c = contentOf(s)
+        c.addView(label("Thông tin giao hàng", 18f, dark, true))
 
-        lateinit var orderButton: Button
-        orderButton = button("🔎 Kiểm tra đơn hàng") {
-            val addr = address.text.toString().trim()
-            if (addr.isEmpty()) { toast("Vui lòng nhập địa chỉ giao hàng"); return@button }
-            orderButton.isEnabled = false
-            val arr = cartJson()
-            val body = JSONObject().apply { put("items", arr); put("address", addr); put("delivery_time", delivery.text.toString().trim()); put("note", note.text.toString().trim()) }
+        // Thông báo về khoảng cách giao hàng — nhắc khách ghi rõ, đầy đủ địa chỉ
+        // (số nhà, đường, phường/xã, quận/huyện...) để hệ thống xác định đúng
+        // khoảng cách. Nếu địa chỉ vượt quá phạm vi giao hàng của quán, hệ
+        // thống sẽ báo rõ lý do ở bước "Xem lại tổng tiền" bên dưới và không
+        // cho đặt hàng tiếp.
+        val noticeBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; background = bg(Color.rgb(255, 244, 230), 12); setPadding(dp(12), dp(10), dp(12), dp(10)) }
+        noticeBox.addView(label("🚴 Lưu ý khoảng cách giao hàng", 14f, Color.rgb(180, 95, 6), true))
+        noticeBox.addView(label("Vui lòng ghi rõ, đầy đủ địa chỉ (số nhà, đường, phường/xã, tỉnh/thành) để hệ thống xác nhận chính xác khoảng cách giao hàng. Quán chỉ giao hàng trong bán kính ${String.format("%.0f", DistanceHelper.MAX_DELIVERY_KM)}km từ ${DistanceHelper.STORE_ADDRESS.substringBefore(",")} — nếu địa chỉ vượt quá phạm vi này, đơn hàng sẽ không đặt được.", 12.5f, Color.rgb(120, 76, 20)).apply { setPadding(0, dp(3), 0, 0) })
+        c.addView(noticeBox, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8); bottomMargin = dp(10) })
+
+        val address = EditText(this).apply { hint = "Địa chỉ giao hàng (số nhà, đường, phường/xã...)"; setText(lastAddress()); textSize = 15f; setPadding(dp(12), dp(10), dp(12), dp(10)); background = bg(Color.WHITE, 12) }
+        val time = EditText(this).apply { hint = "Giờ giao hàng mong muốn (bắt buộc)"; textSize = 15f; setPadding(dp(12), dp(10), dp(12), dp(10)); background = bg(Color.WHITE, 12) }
+        val note = EditText(this).apply { hint = "Ghi chú cho quán (không bắt buộc)"; textSize = 15f; setPadding(dp(12), dp(10), dp(12), dp(10)); background = bg(Color.WHITE, 12) }
+        listOf(address, time, note).forEach { c.addView(it, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) }) }
+
+        val summaryBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        c.addView(summaryBox, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+
+        fun itemsJson(): JSONArray {
+            val arr = JSONArray()
+            cart.forEach { (id, qty) -> arr.put(JSONObject().put("food_id", id).put("qty", qty)) }
+            return arr
+        }
+
+        val previewBtn = button("Xem lại tổng tiền") {
+            if (address.text.toString().trim().isBlank()) { toast("Vui lòng nhập địa chỉ giao hàng"); return@button }
+            // Giờ giao hàng là bắt buộc: chặn ngay tại bước xem lại tổng tiền
+            // nếu khách chưa nhập, không để trống mặc định "giao ngay" nữa.
+            if (time.text.toString().trim().isBlank()) { toast("Vui lòng nhập giờ giao hàng"); return@button }
+            summaryBox.removeAllViews(); val loadingView = loading(summaryBox, "Đang kiểm tra đơn hàng & khoảng cách giao hàng...")
             executor.execute {
-                try {
-                    val r = api.request("order_preview", "POST", body.toString())
-                    runOnUiThread {
-                        orderButton.isEnabled = true
-                        if (r.optBoolean("ok")) {
-                            val d = r.getJSONObject("data")
-                            val total = d.optInt("total")
-                            AlertDialog.Builder(this)
-                                .setTitle("Kiểm tra đơn hàng")
-                                .setMessage("Tổng tiền máy chủ xác nhận: ${money(total)}\n\nĐịa chỉ: $addr\n\nBấm ĐẶT HÀNG để tạo đơn thật.")
-                                .setNegativeButton("Sửa lại", null)
-                                .setPositiveButton("ĐẶT HÀNG") { _, _ -> createOrder(body) }
-                                .show()
-                        } else toast(r.optString("message", "Không thể kiểm tra đơn hàng"))
-                    }
-                } catch (_: Exception) { runOnUiThread { orderButton.isEnabled = true; toast("Không kết nối được máy chủ") } }
-            }
-        }
-        root.addView(orderButton)
-        root.addView(button("← Giỏ hàng") { showCart() })
-    }
-
-    private fun cartJson(): JSONArray {
-        val arr = JSONArray()
-        cart.forEach { (id, qty) -> arr.put(JSONObject().put("food_id", id).put("qty", qty)) }
-        return arr
-    }
-
-    private fun createOrder(body: JSONObject) {
-        // Deterministic idempotency key: the same order payload gets the same key.
-        // This prevents duplicate orders when the network times out and the user retries.
-        val key = idempotencyKeyFor(body.toString())
-        executor.execute {
-            try {
-                val r = api.request("create_order", "POST", body.toString(), idempotencyKey = key)
+                val body = JSONObject().put("address", address.text.toString().trim()).put("items", itemsJson()).toString()
+                val r = account.request("order_preview", "POST", body)
+                val data0 = r.optJSONObject("data") ?: JSONObject()
+                // Nếu server chưa tự tính khoảng cách (chưa có distance_km),
+                // app tự geocode địa chỉ quán + địa chỉ khách để tính khoảng
+                // cách dự phòng, áp giới hạn giao hàng DistanceHelper.MAX_DELIVERY_KM.
+                var clientDistance: Double? = null
+                var clientDistanceFailed = false
+                if (r.optBoolean("ok") && !data0.has("distance_km")) {
+                    clientDistance = DistanceHelper.distanceFromStoreKm(address.text.toString().trim())
+                    clientDistanceFailed = clientDistance == null
+                }
                 runOnUiThread {
-                    if (r.optBoolean("ok")) {
-                        cart.clear(); saveCart()
-                        showPayment(r.getJSONObject("data"))
-                    } else toast(r.optString("message", "Không thể tạo đơn hàng"))
-                }
-            } catch (_: Exception) {
-                runOnUiThread {
-                    toast("Mạng chập chờn. Bạn có thể thử lại; hệ thống sẽ chống tạo trùng đơn.")
-                }
-            }
-        }
-    }
-
-    private fun idempotencyKeyFor(payload: String): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(payload.toByteArray(Charsets.UTF_8))
-        return digest.joinToString("") { "%02x".format(it) }
-    }
-
-    private fun showPayment(data: JSONObject) {
-        paymentPolling = false
-        mainHandler.removeCallbacksAndMessages(null)
-        setup("Thanh toán đơn hàng")
-        val order = data.getJSONObject("order")
-        val p = data.getJSONObject("payment")
-        val code = order.getString("code")
-        val total = order.getInt("total")
-        val statusView = TextView(this).apply {
-            text = "⏳ Đang chờ xác nhận thanh toán...\nMã đơn: $code"
-            textSize = 18f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setPadding(0, 0, 0, dp(12))
-        }
-        root.addView(statusView)
-        root.addView(TextView(this).apply {
-            text = "Mã đơn: $code\nSố tiền: ${money(total)}\nNgân hàng: ${p.optString("bank_display_name", p.optString("bank_name"))}\nSTK: ${p.optString("bank_account_no", p.optString("bank_account"))}\nChủ TK: ${p.optString("bank_account_name", p.optString("account_name"))}\nNội dung: ${p.optString("transfer_content")}"
-            textSize = 17f
-            setPadding(0, 0, 0, dp(14))
-        })
-
-        // Wrap the QR in its own container so it can be hidden as one unit
-        // the moment payment is confirmed.
-        val qrContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val qr = ImageView(this).apply { adjustViewBounds = true; minimumHeight = dp(220); scaleType = ImageView.ScaleType.CENTER_INSIDE }
-        qrContainer.addView(qr, LinearLayout.LayoutParams(-1, dp(260)))
-        root.addView(qrContainer)
-        loadImageInto(p.optString("qr_url"), qr)
-
-        val openQrButton = button("📱 Mở QR bằng trình duyệt/app ngân hàng") { openUrl(p.optString("qr_url")) }
-        root.addView(openQrButton)
-        root.addView(button("🔄 Kiểm tra ngay") { showOrder(code) })
-        root.addView(button("← Trang chủ") { showHome() })
-
-        startPaymentPolling(code, statusView, qrContainer, openQrButton)
-    }
-
-    private fun startPaymentPolling(code: String, statusView: TextView, qrContainer: View, openQrButton: View) {
-        paymentPolling = true
-        val startedAt = System.currentTimeMillis()
-        val maxDurationMs = 10 * 60 * 1000L
-
-        fun poll() {
-            if (!paymentPolling || isFinishing || isDestroyed) return
-            if (System.currentTimeMillis() - startedAt >= maxDurationMs) {
-                paymentPolling = false
-                statusView.text = "⏳ Chưa nhận được xác nhận thanh toán. Bạn có thể bấm kiểm tra lại."
-                return
-            }
-            executor.execute {
-                var paid = false
-                try {
-                    val r = api.request("order", params = mapOf("code" to code))
-                    val d = r.optJSONObject("data")
-                    val o = d?.optJSONObject("order")
-                    paid = o?.optString("payment_status") == "paid"
-                } catch (_: Exception) {
-                    // Keep polling silently; the user can still use "Kiểm tra ngay".
-                }
-
-                if (paid) {
-                    // Stop polling on the background thread first, before touching the UI,
-                    // so a second in-flight poll() can't race and schedule another round.
-                    paymentPolling = false
-
-                    // 1) Reload account info (points/profile) right away so it's fresh
-                    // the next time the user opens "Tài khoản".
-                    try { api.request("profile") } catch (_: Exception) { }
-
-                    runOnUiThread {
-                        // 2) Ẩn QR ngay lập tức.
-                        qrContainer.visibility = View.GONE
-                        openQrButton.visibility = View.GONE
-                        // 3) Hiển thị "Đã thanh toán" kèm mã đơn.
-                        statusView.text = "✅ Đã thanh toán\nMã đơn: $code"
-                        toast("Thanh toán đơn $code đã được xác nhận")
-                        // 4) Tải lại chi tiết đơn hàng từ máy chủ.
-                        mainHandler.postDelayed({ showOrder(code) }, 900)
+                    summaryBox.removeView(loadingView)
+                    if (!r.optBoolean("ok")) { summaryBox.addView(label(r.optString("message", "Không thể tính đơn hàng."), 14f, danger)); return@runOnUiThread }
+                    val data = data0
+                    val total = data.optInt("total")
+                    // Ưu tiên khoảng cách do server tính (distance_km /
+                    // max_distance_km) nếu có; nếu không thì dùng khoảng cách
+                    // ước lượng tính ngay trên app (DistanceHelper) so với
+                    // giới hạn giao hàng tối đa 15km.
+                    var outOfRange = false
+                    if (data.has("distance_km")) {
+                        val distance = data.optDouble("distance_km")
+                        val maxDistance = if (data.has("max_distance_km")) data.optDouble("max_distance_km") else DistanceHelper.MAX_DELIVERY_KM
+                        outOfRange = distance > maxDistance
+                        val distText = "📍 Khoảng cách giao hàng: ${String.format("%.1f", distance)} km (tối đa ${String.format("%.1f", maxDistance)} km)"
+                        summaryBox.addView(label(distText, 13.5f, if (outOfRange) danger else ok, true))
+                    } else if (clientDistance != null) {
+                        val distance = clientDistance
+                        outOfRange = distance > DistanceHelper.MAX_DELIVERY_KM
+                        val distText = "📍 Khoảng cách giao hàng (ước tính): ${String.format("%.1f", distance)} km (tối đa ${String.format("%.1f", DistanceHelper.MAX_DELIVERY_KM)} km)"
+                        summaryBox.addView(label(distText, 13.5f, if (outOfRange) danger else ok, true))
+                    } else if (clientDistanceFailed) {
+                        summaryBox.addView(label("⚠️ Không thể xác định chính xác khoảng cách từ địa chỉ này. Vui lòng ghi rõ số nhà, tên đường, phường/xã, tỉnh/thành để hệ thống xác nhận đúng khoảng cách giao hàng.", 12.5f, Color.rgb(180, 95, 6)))
                     }
-                } else {
-                    runOnUiThread {
-                        if (paymentPolling) statusView.text = "⏳ Đang chờ ngân hàng xác nhận...\nMã đơn: $code\nTự kiểm tra mỗi 5 giây"
+                    if (outOfRange) {
+                        summaryBox.addView(label("❌ Địa chỉ này cách quán quá ${String.format("%.0f", DistanceHelper.MAX_DELIVERY_KM)}km, nằm ngoài phạm vi giao hàng. Vui lòng kiểm tra lại địa chỉ hoặc chọn địa chỉ gần hơn.", 13.5f, danger).apply { setPadding(0, dp(4), 0, dp(4)) })
+                        return@runOnUiThread
                     }
-                    if (paymentPolling) mainHandler.postDelayed({ poll() }, 5000L)
-                }
-            }
-        }
-        mainHandler.post { poll() }
-    }
-
-    private fun showOrders() {
-        if (api.token() == null) { showLogin(); return }
-        setup("Đơn hàng của tôi")
-        val loading = TextView(this).apply { text = "Đang tải..."; textSize = 17f }; root.addView(loading)
-        executor.execute {
-            try {
-                val r = api.request("orders")
-                runOnUiThread {
-                    if (!r.optBoolean("ok")) { loading.text = r.optString("message", "Không tải được đơn hàng"); return@runOnUiThread }
-                    val a = r.getJSONObject("data").getJSONArray("orders")
-                    root.removeView(loading)
-                    if (a.length() == 0) root.addView(TextView(this).apply { text = "Chưa có đơn hàng."; textSize = 17f })
-                    for (i in 0 until a.length()) {
-                        root.addView(orderCard(a.getJSONObject(i)))
-                    }
-                    root.addView(button("🔄 Làm mới") { showOrders() })
-                    root.addView(button("← Trang chủ") { showHome() })
-                }
-            } catch (_: Exception) { runOnUiThread { loading.text = "Không tải được đơn hàng. Vui lòng thử lại." } }
-        }
-    }
-
-    /** 1 thẻ đơn hàng trong danh sách — đủ 6 cột như bảng account.php trên web:
-     *  Mã đơn (+ngày), Tổng tiền, Thanh toán, Trạng thái, Quay thưởng, Nhận hàng. */
-    private fun orderCard(o: JSONObject): View {
-        val code = o.getString("code")
-        val createdAt = o.optString("created_at")
-        val total = o.optInt("total")
-        val paid = o.optString("payment_status") == "paid"
-        val status = o.optString("status")
-        val luckyCode = o.optString("lucky_code")
-        val confirmed = o.optInt("delivery_confirmed") == 1
-        val points = o.optInt("points_earned")
-
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            setBackgroundColor(Color.WHITE)
-            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 0, 0, dp(12)) }
-            isClickable = true
-            setOnClickListener { showOrder(code) }
-        }
-
-        card.addView(TextView(this).apply {
-            text = "Mã đơn: $code" + if (createdAt.isNotBlank()) "\n$createdAt" else ""
-            textSize = 16f; setTypeface(null, android.graphics.Typeface.BOLD)
-        })
-        card.addView(row("Tổng tiền", money(total)))
-        card.addView(row("Thanh toán", if (paid) "✅ Đã thanh toán" else "⏳ Chưa thanh toán"))
-        card.addView(row("Trạng thái", status + if (confirmed) "\nKhách đã xác nhận nhận hàng" else ""))
-        card.addView(row("Quay thưởng", if (luckyCode.isNotBlank()) luckyCode else "—"))
-
-        // Cột "Nhận hàng"
-        when {
-            confirmed -> card.addView(row("Nhận hàng", "✅ Đã nhận hàng  •  +$points điểm"))
-            status == "Hoàn thành" -> {
-                lateinit var confirmBtn: Button
-                confirmBtn = button("📦 Tôi đã nhận hàng") {
-                    confirmBtn.isEnabled = false
-                    executor.execute {
-                        try {
-                            val rr = api.request("confirm_delivery", "POST", JSONObject().put("code", code).toString())
+                    summaryBox.addView(label("Tổng tiền: ${money(total)}", 19f, primary, true))
+                    summaryBox.addView(button("✅ Đặt hàng ngay") {
+                        if (time.text.toString().trim().isBlank()) { toast("Vui lòng nhập giờ giao hàng"); return@button }
+                        summaryBox.addView(label("⏳ Đang tạo đơn hàng...", 14f, secondary))
+                        val idem = UUID.randomUUID().toString()
+                        val orderBody = JSONObject().put("address", address.text.toString().trim())
+                            .put("delivery_time", time.text.toString().trim()).put("note", note.text.toString().trim())
+                            .put("items", itemsJson()).toString()
+                        executor.execute {
+                            val cr = account.request("create_order", "POST", orderBody, mapOf("X-Idempotency-Key" to idem))
                             runOnUiThread {
-                                if (rr.optBoolean("ok")) { toast(rr.optString("message", "Đã xác nhận nhận hàng")); showOrders() }
-                                else { confirmBtn.isEnabled = true; toast(rr.optString("message", "Chưa thể xác nhận nhận hàng")) }
-                            }
-                        } catch (_: Exception) { runOnUiThread { confirmBtn.isEnabled = true; toast("Không kết nối được máy chủ") } }
-                    }
-                }
-                card.addView(confirmBtn)
-            }
-            status == "Đang giao" -> card.addView(row("Nhận hàng", "🚚 Đang giao. Nút xác nhận sẽ xuất hiện khi đơn Hoàn thành."))
-            else -> card.addView(row("Nhận hàng", "Chưa thể xác nhận nhận hàng."))
-        }
-
-        return card
-    }
-
-    private fun row(label: String, value: String) = TextView(this).apply {
-        text = "$label: $value"; textSize = 15f; setPadding(0, dp(4), 0, dp(4))
-    }
-
-    private fun showOrder(code: String) {
-        setup("Chi tiết đơn $code")
-        val loading = TextView(this).apply { text = "Đang tải đơn..."; textSize = 17f }
-        root.addView(loading)
-        executor.execute {
-            try {
-                val r = api.request("order", params = mapOf("code" to code))
-                runOnUiThread {
-                    root.removeView(loading)
-                    if (!r.optBoolean("ok")) { root.addView(TextView(this).apply { text = r.optString("message", "Không tải được đơn"); textSize = 17f }); return@runOnUiThread }
-                    val d = r.getJSONObject("data")
-                    val o = d.getJSONObject("order")
-                    val items = d.getJSONArray("items")
-                    val status = o.optString("status")
-                    val paid = o.optString("payment_status") == "paid"
-                    val confirmed = o.optInt("delivery_confirmed") == 1
-                    val points = o.optInt("points_earned")
-                    val lucky = o.optString("lucky_code", "")
-
-                    root.addView(TextView(this).apply {
-                        text = "Trạng thái: $status\nThanh toán: ${if (paid) "Đã thanh toán" else "Chưa thanh toán"}\nTổng: ${money(o.getInt("total"))}\nĐịa chỉ: ${o.optString("address")}\nGiao: ${o.optString("delivery_time")}" + if (o.optString("note").isNotBlank()) "\nGhi chú: ${o.optString("note")}" else ""
-                        textSize = 17f
-                    })
-
-                    root.addView(TextView(this).apply { text = "\nTiến trình đơn hàng"; textSize = 19f; setTypeface(null, 1) })
-                    listOf("Chờ xác nhận", "Đã xác nhận", "Đang nấu", "Đang giao", "Hoàn thành").forEach { s ->
-                        root.addView(TextView(this).apply { text = if (statusRank(status) >= statusRank(s)) "✓ $s" else "○ $s"; textSize = 16f; setPadding(dp(8), dp(3), 0, dp(3)) })
-                    }
-
-                    root.addView(TextView(this).apply { text = "\nMón đã đặt"; textSize = 19f; setTypeface(null, 1) })
-                    for (i in 0 until items.length()) {
-                        val it = items.getJSONObject(i)
-                        root.addView(TextView(this).apply { text = "• ${it.optString("name")} × ${it.optInt("qty")} = ${money(it.optInt("price") * it.optInt("qty"))}"; textSize = 16f; setPadding(0, dp(6), 0, dp(6)) })
-                    }
-
-                    if (lucky.isNotBlank()) root.addView(TextView(this).apply { text = "\n🎁 Mã dự thưởng: $lucky"; textSize = 20f; setTypeface(null, 1) })
-                    if (confirmed) root.addView(TextView(this).apply { text = "\n✅ Bạn đã xác nhận nhận hàng\n⭐ Đã cộng: +$points điểm"; textSize = 18f })
-
-                    val p = d.optJSONObject("payment")
-                    if (p != null && !paid) {
-                        root.addView(button("📱 Mở QR thanh toán") { openUrl(p.optString("qr_url")) })
-                        val qr = ImageView(this).apply { adjustViewBounds = true; scaleType = ImageView.ScaleType.CENTER_INSIDE }
-                        root.addView(qr, LinearLayout.LayoutParams(-1, dp(250)))
-                        loadImageInto(p.optString("qr_url"), qr)
-                    }
-
-                    if (status == "Hoàn thành" && !confirmed) {
-                        lateinit var confirm: Button
-                        confirm = button("✅ Tôi đã nhận hàng") {
-                            confirm.isEnabled = false
-                            executor.execute {
-                                try {
-                                    val rr = api.request("confirm_delivery", "POST", JSONObject().put("code", code).toString())
-                                    runOnUiThread {
-                                        confirm.isEnabled = true
-                                        if (rr.optBoolean("ok")) {
-                                            toast(rr.optString("message", "Đã xác nhận nhận hàng"))
-                                            showOrder(code)
-                                        } else toast(rr.optString("message", "Chưa thể xác nhận nhận hàng"))
-                                    }
-                                } catch (_: Exception) { runOnUiThread { confirm.isEnabled = true; toast("Không kết nối được máy chủ") } }
+                                if (!cr.optBoolean("ok")) { toast(cr.optString("message", "Đặt hàng thất bại")); return@runOnUiThread }
+                                saveLastAddress(address.text.toString().trim())
+                                cart.clear(); saveLocalCart()
+                                val code = cr.optJSONObject("data")?.optJSONObject("order")?.optString("code") ?: ""
+                                toast("Đặt hàng thành công!")
+                                showOrderDetail(code)
                             }
                         }
-                        root.addView(confirm)
+                    })
+                }
+            }
+        }
+        c.addView(previewBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+    }
+
+    // =========================================================================
+    // ĐƠN HÀNG — danh sách & chi tiết lấy từ server (không lưu cục bộ).
+    // =========================================================================
+    private fun showOrders() {
+        if (!account.isLoggedIn()) { toast("Vui lòng đăng nhập để xem đơn hàng"); showLogin(); return }
+        val s = shell("Đơn hàng", 3); setContentView(s); val c = contentOf(s)
+        val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }; c.addView(listBox)
+        val loadingView = loading(listBox)
+        executor.execute {
+            val r = account.request("orders")
+            runOnUiThread {
+                listBox.removeView(loadingView)
+                if (!r.optBoolean("ok")) { listBox.addView(label(r.optString("message", "Không tải được đơn hàng."), 14f, danger)); return@runOnUiThread }
+                val arr = r.optJSONObject("data")?.optJSONArray("orders") ?: JSONArray()
+                if (arr.length() == 0) { listBox.addView(label("📦 Chưa có đơn hàng nào", 20f, dark, true)); listBox.addView(label("Đơn hàng được đồng bộ trực tiếp với tài khoản trên website.", 13f, secondary)); listBox.addView(button("Đặt món ngay") { showMenu() }); return@runOnUiThread }
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val payStatus = o.optString("payment_status", "pending")
+                    val card = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; background = bg(Color.WHITE, 15); setPadding(dp(14), dp(12), dp(14), dp(12)); layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(9) } }
+                    card.addView(label("#${o.optString("code")}", 16f, dark, true))
+                    card.addView(label("${money(o.optInt("total"))} • ${o.optString("created_at")}", 14f, secondary))
+                    val row = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                    row.addView(label("Trạng thái: ${o.optString("status")}", 14f, primary, true), LinearLayout.LayoutParams(0, -2, 1f))
+                    row.addView(label(if (payStatus == "paid") "✅ Đã thanh toán" else "💳 Chờ thanh toán", 13f, if (payStatus == "paid") ok else Color.rgb(198, 130, 8)))
+                    card.addView(row)
+                    card.setOnClickListener { showOrderDetail(o.optString("code")) }
+                    listBox.addView(card)
+                }
+            }
+        }
+    }
+
+    private fun showOrderDetail(code: String) {
+        stopPolling()
+        val s = shell("Đơn $code", 3); setContentView(s); val c = contentOf(s)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }; c.addView(box)
+        loading(box)
+        renderOrderDetail(box, code)
+    }
+
+    private fun renderOrderDetail(box: LinearLayout, code: String) {
+        executor.execute {
+            val r = account.request("order", "GET", null, emptyMap(), mapOf("code" to code))
+            runOnUiThread {
+                box.removeAllViews()
+                if (!r.optBoolean("ok")) { box.addView(label(r.optString("message", "Không tải được đơn hàng."), 14f, danger)); return@runOnUiThread }
+                val data = r.optJSONObject("data") ?: JSONObject()
+                val o = data.optJSONObject("order") ?: JSONObject()
+                val items = data.optJSONArray("items") ?: JSONArray()
+                val payment = data.optJSONObject("payment")
+                val status = o.optString("status")
+                val payStatus = o.optString("payment_status", "pending")
+                val confirmed = status in listOf("Đã xác nhận", "Đang nấu", "Đang giao", "Hoàn thành")
+
+                box.addView(label("Mã đơn: $code", 16f, dark, true))
+                box.addView(label("Trạng thái: $status", 15f, primary, true))
+                box.addView(label("Thanh toán: " + if (payStatus == "paid") "✅ Đã thanh toán" else "💳 Chờ thanh toán", 14f, if (payStatus == "paid") ok else Color.rgb(198, 130, 8)))
+                box.addView(label("Địa chỉ: ${o.optString("address")}", 13f, secondary))
+                if (o.optString("delivery_time").isNotBlank()) box.addView(label("Giờ giao: ${o.optString("delivery_time")}", 13f, secondary))
+                if (o.optString("note").isNotBlank()) box.addView(label("Ghi chú: ${o.optString("note")}", 13f, secondary))
+
+                box.addView(label("Món đã đặt", 16f, dark, true).apply { setPadding(0, dp(14), 0, dp(6)) })
+                for (i in 0 until items.length()) {
+                    val it = items.getJSONObject(i)
+                    box.addView(label("• ${it.optString("name")} x${it.optInt("qty")} — ${money(it.optInt("price") * it.optInt("qty"))}", 14f, dark))
+                }
+                box.addView(label("Tổng cộng: ${money(o.optInt("total"))}", 18f, primary, true).apply { setPadding(0, dp(10), 0, dp(4)) })
+
+                // ---- THANH TOÁN QR (VietQR chuyển khoản ngân hàng) ----
+                if (payStatus != "paid" && payment != null) {
+                    val payBox = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; background = bg(Color.WHITE, 16); setPadding(dp(14), dp(14), dp(14), dp(14)) }
+                    payBox.addView(label("💳 Quét mã để thanh toán", 16f, dark, true))
+                    val qr = ImageView(this@MainActivity).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+                    payBox.addView(qr, LinearLayout.LayoutParams(dp(200), dp(200)).apply { topMargin = dp(8) })
+                    ImageLoader.load(qr, payment.optString("qr_url"))
+                    payBox.addView(label("Ngân hàng: ${payment.optString("bank_display_name")}", 13f, secondary))
+                    payBox.addView(label("Số TK: ${payment.optString("bank_account_no")}", 13f, secondary))
+                    payBox.addView(label("Chủ TK: ${payment.optString("bank_account_name")}", 13f, secondary))
+                    payBox.addView(label("Nội dung CK: ${payment.optString("transfer_content")}", 13f, dark, true))
+                    payBox.addView(label("Số tiền: ${money(payment.optInt("amount"))}", 15f, primary, true))
+                    payBox.addView(label("Hệ thống tự động xác nhận sau khi nhận được chuyển khoản.", 12f, secondary).apply { setPadding(0, dp(6), 0, 0) })
+                    box.addView(payBox, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+
+                    // Tự động dò trạng thái thanh toán mỗi 4 giây, giống order.php trên web.
+                    stopPolling()
+                    val runnable = object : Runnable {
+                        override fun run() { renderOrderDetail(box, code); handler.postDelayed(this, 4000) }
                     }
+                    pollRunnable = runnable
+                    handler.postDelayed(runnable, 4000)
+                } else stopPolling()
 
-                    root.addView(button("🔄 Làm mới") { showOrder(code) })
-                    root.addView(button("← Đơn hàng") { showOrders() })
-                    root.addView(button("← Trang chủ") { showHome() })
+                // ---- XÁC NHẬN ĐÃ NHẬN HÀNG ----
+                if ((o.optInt("delivery_confirmed") == 1)) {
+                    box.addView(label("✅ Đã nhận hàng • +${o.optInt("points_earned")} điểm", 14f, ok, true).apply { setPadding(0, dp(10), 0, 0) })
+                } else if (status == "Hoàn thành") {
+                    box.addView(button("📦 Tôi đã nhận hàng") {
+                        executor.execute {
+                            val cr = account.request("confirm_delivery", "POST", JSONObject().put("code", code).toString())
+                            runOnUiThread { toast(cr.optString("message", if (cr.optBoolean("ok")) "Đã xác nhận" else "Có lỗi xảy ra")); renderOrderDetail(box, code) }
+                        }
+                    }.apply { layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) } })
                 }
-            } catch (_: Exception) { runOnUiThread { loading.text = "Không tải được chi tiết đơn. Vui lòng thử lại." } }
+
+                // ---- MÃ QUAY THƯỞNG ----
+                val luckyCode = o.optString("lucky_code", "")
+                if (confirmed && luckyCode.isNotBlank() && luckyCode != "null") {
+                    box.addView(button("🎁 Dùng mã quay thưởng: $luckyCode") { showLucky(luckyCode) }.apply { layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) } })
+                }
+            }
         }
     }
 
-    private fun statusRank(status: String): Int = when (status) {
-        "Chờ xác nhận" -> 0
-        "Đã xác nhận" -> 1
-        "Đang nấu" -> 2
-        "Đang giao" -> 3
-        "Hoàn thành" -> 4
-        else -> -1
-    }
-
-    private fun showProfile() {
-        if (api.token() == null) { showLogin(); return }
-        setup("Tài khoản")
-        val loading = TextView(this).apply { text = "Đang tải tài khoản..."; textSize = 17f }
-        root.addView(loading)
-        executor.execute {
-            try {
-                val r = api.request("profile")
+    // =========================================================================
+    // QUAY SỐ MAY MẮN — quay thưởng theo mã đơn (dùng 1 lần).
+    // =========================================================================
+    private fun showLucky(prefillCode: String?) {
+        if (!account.isLoggedIn()) { toast("Vui lòng đăng nhập"); showLogin(); return }
+        val s = shell("Quay số trúng thưởng", 4); setContentView(s); val c = contentOf(s)
+        c.addView(label("🎁 Bốc thăm trúng thưởng", 20f, dark, true))
+        c.addView(label("Mỗi đơn hàng đã xác nhận tặng 1 mã quay thưởng, dùng được đúng 1 lần.", 13f, secondary))
+        val codeInput = EditText(this).apply { hint = "VD: LK-7K9QRX"; setText(prefillCode ?: ""); textSize = 16f; setPadding(dp(12), dp(10), dp(12), dp(10)); background = bg(Color.WHITE, 12) }
+        c.addView(codeInput, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10); bottomMargin = dp(10) })
+        val resultBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }; c.addView(resultBox)
+        c.addView(button("🎁 Quay ngay") {
+            val code = codeInput.text.toString().trim().uppercase()
+            if (code.isBlank()) { toast("Vui lòng nhập mã quay thưởng"); return@button }
+            resultBox.removeAllViews(); val lv = loading(resultBox, "Đang quay số...")
+            executor.execute {
+                val r = account.request("lucky_draw", "POST", JSONObject().put("code", code).toString())
                 runOnUiThread {
-                    root.removeView(loading)
-                    if (!r.optBoolean("ok")) { toast(r.optString("message", "Phiên đăng nhập hết hạn")); api.clearToken(); showLogin(); return@runOnUiThread }
-                    val c = r.getJSONObject("data").getJSONObject("customer")
-                    root.addView(TextView(this).apply { text = "Họ tên: ${c.optString("name")}\nSố điện thoại: ${c.optString("phone")}\nĐiểm tích luỹ: ${c.optInt("points")}"; textSize = 18f })
-                    root.addView(button("📦 Đơn hàng") { showOrders() })
-                    root.addView(button("🚪 Đăng xuất") { api.clearToken(); showHome() })
-                    root.addView(button("← Trang chủ") { showHome() })
+                    resultBox.removeView(lv)
+                    if (!r.optBoolean("ok")) { resultBox.addView(label(r.optString("message", "Có lỗi xảy ra."), 14f, danger)); return@runOnUiThread }
+                    val data = r.optJSONObject("data") ?: JSONObject()
+                    val already = data.optBoolean("already")
+                    val prizeBox = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; background = bg(Color.WHITE, 16); setPadding(dp(16), dp(16), dp(16), dp(16)) }
+                    prizeBox.addView(label(if (already) "Mã này đã được sử dụng rồi!" else "🎉 Chúc mừng bạn!", 17f, dark, true))
+                    prizeBox.addView(label("🎁 ${data.optString("prize_name")}", 20f, primary, true).apply { setPadding(0, dp(8), 0, dp(8)) })
+                    prizeBox.addView(label(if (already) "Mỗi mã chỉ quay được 1 lần. Đặt thêm đơn để nhận mã mới nhé!" else "Vui lòng liên hệ quán để nhận thưởng.", 13f, secondary))
+                    resultBox.addView(prizeBox)
                 }
-            } catch (_: Exception) { runOnUiThread { toast("Không kết nối được máy chủ") } }
+            }
+        }.apply { layoutParams = LinearLayout.LayoutParams(-1, -2) })
+        c.addView(ghostButton("🔢 Số may mắn hằng ngày") { showDaily() }.apply { layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) } })
+    }
+
+    // =========================================================================
+    // SỐ MAY MẮN HẰNG NGÀY — chương trình tự động, đối 4 số cuối mã quay thưởng
+    // với số công bố lúc 16:15 giờ VN hằng ngày.
+    // =========================================================================
+    private fun showDaily() {
+        if (!account.isLoggedIn()) { toast("Vui lòng đăng nhập"); showLogin(); return }
+        val s = shell("Số may mắn hằng ngày", 4); setContentView(s); val c = contentOf(s)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }; c.addView(box)
+        val lv = loading(box)
+        executor.execute {
+            val r = account.request("daily_number")
+            runOnUiThread {
+                box.removeView(lv)
+                if (!r.optBoolean("ok")) { box.addView(label(r.optString("message", "Không tải được dữ liệu."), 14f, danger)); return@runOnUiThread }
+                val d = r.optJSONObject("data") ?: JSONObject()
+                val prizeBox = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; background = bg(Color.WHITE, 16); setPadding(dp(16), dp(16), dp(16), dp(16)) }
+                prizeBox.addView(label("Số dự thưởng kỳ ${d.optString("period")}", 15f, dark, true))
+                if (d.optBoolean("published")) {
+                    prizeBox.addView(label(d.optString("number"), 30f, primary, true))
+                    prizeBox.addView(label("✅ Số của kỳ này đã được công bố.", 13f, secondary))
+                } else if (d.optBoolean("draw_due")) {
+                    prizeBox.addView(label("⏳ Chưa công bố", 22f, secondary))
+                    prizeBox.addView(label("Đã đến giờ quay nhưng số chưa được duyệt & công bố.", 13f, secondary))
+                } else {
+                    prizeBox.addView(label("⏳ Chưa quay", 22f, secondary))
+                    prizeBox.addView(label("Hệ thống tự bốc số lúc ${d.optString("draw_time")} hôm nay.", 13f, secondary))
+                }
+                box.addView(prizeBox, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(14) })
+
+                box.addView(label("Thể lệ (đối 4 số cuối mã quay thưởng, từ phải sang):", 14f, dark, true))
+                val rules = d.optJSONArray("rules") ?: JSONArray()
+                for (i in 0 until rules.length()) { val ru = rules.getJSONObject(i); box.addView(label("• ${ru.optString("label")} — ${ru.optString("prize")}", 13f, secondary)) }
+
+                val history = d.optJSONArray("history") ?: JSONArray()
+                if (history.length() > 0) {
+                    box.addView(label("Lịch sử mã dự thưởng", 16f, dark, true).apply { setPadding(0, dp(14), 0, dp(6)) })
+                    for (i in 0 until history.length()) {
+                        val h = history.getJSONObject(i)
+                        val matched = h.optBoolean("matched")
+                        val row = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; background = bg(Color.WHITE, 12); setPadding(dp(10), dp(9), dp(10), dp(9)); layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(7) } }
+                        row.addView(label("#${h.optString("order_code")} • kỳ ${h.optString("week_key")} • số cuối ${h.optString("digits")}", 13f, dark))
+                        row.addView(label(if (matched) "🎉 Trúng ${h.optString("tier_label")} — ${h.optString("prize_name")}" else "❌ Không trúng", 13f, if (matched) ok else secondary, matched))
+                        box.addView(row)
+                    }
+                }
+            }
         }
     }
 
-    private fun loadImageInto(url: String, imageView: ImageView) {
-        if (url.isBlank()) return
+    // =========================================================================
+    // ĐIỂM TÍCH LUỸ / HẠNG THÀNH VIÊN
+    // =========================================================================
+    private fun showLoyalty() {
+        if (!account.isLoggedIn()) { toast("Vui lòng đăng nhập"); showLogin(); return }
+        val s = shell("Điểm tích luỹ", 4); setContentView(s); val c = contentOf(s)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }; c.addView(box)
+        val lv = loading(box)
+        executor.execute {
+            val r = account.request("loyalty")
+            runOnUiThread {
+                box.removeView(lv)
+                if (!r.optBoolean("ok")) { box.addView(label(r.optString("message", "Không tải được dữ liệu."), 14f, danger)); return@runOnUiThread }
+                val d = r.optJSONObject("data") ?: JSONObject()
+                val points = d.optInt("points")
+                val prizeBox = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; background = bg(Color.WHITE, 16); setPadding(dp(16), dp(16), dp(16), dp(16)) }
+                prizeBox.addView(label("★ ${String.format("%,d", points)} điểm", 24f, primary, true))
+                val next = d.optJSONObject("next_tier")
+                if (next != null) prizeBox.addView(label("Còn ${next.optInt("points_needed")} điểm nữa để đổi \"${next.optString("reward_name")}\".", 13f, secondary))
+                else prizeBox.addView(label("Bạn đã đạt mốc quà cao nhất hiện có.", 13f, secondary))
+                prizeBox.addView(label("Điểm được cộng sau khi bạn xác nhận đã nhận hàng. Mỗi 50.000đ = 1 điểm.", 12f, secondary).apply { setPadding(0, dp(6), 0, 0) })
+                box.addView(prizeBox, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(14) })
+
+                box.addView(label("Mốc quà", 16f, dark, true))
+                val tiers = d.optJSONArray("tiers") ?: JSONArray()
+                for (i in 0 until tiers.length()) {
+                    val t = tiers.getJSONObject(i); val eligible = t.optBoolean("eligible")
+                    val row = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; background = bg(Color.WHITE, 12); setPadding(dp(10), dp(9), dp(10), dp(9)); layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) } }
+                    row.addView(label("${t.optInt("points_required")} điểm — ${t.optString("reward_name")}", 13.5f, dark), LinearLayout.LayoutParams(0, -2, 1f))
+                    row.addView(label(if (eligible) "✓ Đủ điều kiện" else "Chưa đủ", 12.5f, if (eligible) ok else secondary))
+                    box.addView(row)
+                }
+
+                val redemptions = d.optJSONArray("redemptions") ?: JSONArray()
+                if (redemptions.length() > 0) {
+                    box.addView(label("Lịch sử đổi quà", 16f, dark, true).apply { setPadding(0, dp(14), 0, dp(6)) })
+                    for (i in 0 until redemptions.length()) {
+                        val red = redemptions.getJSONObject(i)
+                        box.addView(label("• ${red.optString("reward_name")} — ${red.optInt("points_used")} điểm (${red.optString("created_at")})", 13f, secondary))
+                    }
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // TÀI KHOẢN — thông tin đầy đủ, đồng bộ trực tiếp với tài khoản trên web.
+    // =========================================================================
+    private fun showProfile() {
+        val s = shell("Tài khoản", 4); setContentView(s); val c = contentOf(s)
+        if (!account.isLoggedIn()) { c.addView(label("👤 Tài khoản khách hàng", 22f, dark, true)); c.addView(label("Đăng nhập để đồng bộ tài khoản với tài khoản COM11H đang dùng trên website.")); c.addView(button("🔐 Đăng nhập / Đăng ký") { showLogin() }); return }
+        c.addView(label("👤 Tài khoản khách hàng", 22f, dark, true)); val loadingView = label("Đang đồng bộ thông tin tài khoản...", 15f, secondary); c.addView(loadingView)
         executor.execute {
             try {
-                val conn = URL(url).openConnection() as HttpURLConnection
-                conn.connectTimeout = 10000
-                conn.readTimeout = 15000
-                conn.doInput = true
-                val bitmap = conn.inputStream.use { BitmapFactory.decodeStream(it) }
-                conn.disconnect()
-                if (bitmap != null) runOnUiThread { imageView.setImageBitmap(bitmap) }
-            } catch (_: Exception) { }
+                val r = account.request("profile")
+                runOnUiThread {
+                    c.removeView(loadingView)
+                    if (r.optBoolean("ok")) {
+                        val customer = r.optJSONObject("data")?.optJSONObject("customer") ?: r.optJSONObject("data") ?: JSONObject()
+                        c.addView(label("Họ tên: ${customer.optString("name", "Chưa cập nhật")}", 17f, dark, true))
+                        c.addView(label("Số điện thoại: ${customer.optString("phone", "")}"))
+                        c.addView(label("Điểm tích lũy: ${customer.optInt("points", 0)} điểm", 18f, primary, true))
+                        c.addView(label("Toàn bộ đơn hàng, thanh toán và mã quay thưởng của bạn được đồng bộ trực tiếp với tài khoản trên website.", 12.5f, secondary))
+
+                        val grid = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+                        c.addView(grid, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+                        grid.addView(ghostButton("▤ Đơn hàng của tôi") { showOrders() }.apply { layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) } })
+                        grid.addView(ghostButton("⭐ Điểm tích luỹ & hạng thành viên") { showLoyalty() }.apply { layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) } })
+                        grid.addView(ghostButton("🎁 Quay số trúng thưởng") { showLucky(null) }.apply { layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) } })
+                        grid.addView(ghostButton("🔢 Số may mắn hằng ngày") { showDaily() }.apply { layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) } })
+
+                        c.addView(button("🔄 Đồng bộ lại") { showProfile() }.apply { layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) } })
+                        c.addView(button("🚪 Đăng xuất") { account.logout(); showProfile() }.apply { layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) } })
+                    } else {
+                        account.logout(); c.addView(label(r.optString("message", "Phiên đăng nhập đã hết hạn."))); c.addView(button("Đăng nhập lại") { showLogin() })
+                    }
+                }
+            } catch (_: Exception) { runOnUiThread { loadingView.text = "Không thể đồng bộ tài khoản. Kiểm tra mạng rồi thử lại."; c.addView(button("Thử lại") { showProfile() }) } }
         }
     }
 
-    private fun openUrl(url: String) {
-        if (url.isBlank()) { toast("Không có liên kết thanh toán"); return }
-        try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
-        catch (_: Exception) { toast("Thiết bị không có ứng dụng mở liên kết này") }
+    private fun input(hint: String, password: Boolean = false) = EditText(this).apply { this.hint = hint; textSize = 16f; setPadding(dp(12), dp(10), dp(12), dp(10)); if (password) inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD }
+    private fun showLogin() {
+        val s = shell("Đăng nhập", 4); setContentView(s); val c = contentOf(s); val phone = input("Số điện thoại"); val pass = input("Mật khẩu", true); c.addView(phone); c.addView(pass)
+        c.addView(button("Đăng nhập") { val p = phone.text.toString().trim(); val pw = pass.text.toString(); if (p.isBlank() || pw.isBlank()) { toast("Vui lòng nhập đầy đủ thông tin"); return@button }; executor.execute { try { val r = account.request("login", "POST", JSONObject(mapOf("phone" to p, "password" to pw, "device" to "COM11H Android")).toString()); runOnUiThread { if (r.optBoolean("ok")) { account.saveToken(r.optJSONObject("data")?.optString("token", "") ?: ""); toast("Đăng nhập thành công"); showProfile() } else toast(r.optString("message", "Đăng nhập thất bại")) } } catch (_: Exception) { runOnUiThread { toast("Không kết nối được máy chủ tài khoản") } } } })
+        c.addView(button("Đăng ký tài khoản mới") { showRegister() })
     }
-
-    private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    private fun showRegister() {
+        val s = shell("Đăng ký tài khoản", 4); setContentView(s); val c = contentOf(s); val name = input("Họ tên"); val phone = input("Số điện thoại"); val pass = input("Mật khẩu", true); val pass2 = input("Nhập lại mật khẩu", true); c.addView(name); c.addView(phone); c.addView(pass); c.addView(pass2)
+        c.addView(button("Tạo tài khoản") { if (name.text.isBlank() || phone.text.isBlank() || pass.text.length < 6 || pass.text.toString() != pass2.text.toString()) { toast("Kiểm tra lại thông tin đăng ký"); return@button }; executor.execute { try { val body = JSONObject(mapOf("name" to name.text.toString().trim(), "phone" to phone.text.toString().trim(), "password" to pass.text.toString(), "password2" to pass2.text.toString(), "device" to "COM11H Android")).toString(); val r = account.request("register", "POST", body); runOnUiThread { if (r.optBoolean("ok")) { account.saveToken(r.optJSONObject("data")?.optString("token", "") ?: ""); toast("Đăng ký thành công"); showProfile() } else toast(r.optString("message", "Đăng ký thất bại")) } } catch (_: Exception) { runOnUiThread { toast("Không kết nối được máy chủ tài khoản") } } } })
+        c.addView(button("Đăng nhập") { showLogin() })
+    }
 }
